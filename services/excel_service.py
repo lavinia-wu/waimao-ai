@@ -1,0 +1,383 @@
+from __future__ import annotations
+
+from copy import copy
+from pathlib import Path
+from typing import Any, Dict
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.page import PageMargins
+
+from services.amount_words import amount_in_english_words
+from config.settings import settings
+
+
+NAVY = '17365D'
+BLUE = '1F4E79'
+PALE_BLUE = 'EAF1F8'
+WHITE = 'FFFFFF'
+GRID = 'B7C9D6'
+
+
+def list_excel_templates() -> list[Path]:
+    settings.templates_dir.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        (
+            path for path in settings.templates_dir.rglob('*.xlsx')
+            if path.is_file() and not path.name.startswith('~$')
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def get_excel_template_sheets(template_path: str) -> list[str]:
+    source = Path(template_path)
+    if not source.exists():
+        raise FileNotFoundError(f'未找到所选 Excel 模板：{source}')
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    try:
+        return [sheet.title for sheet in workbook.worksheets if sheet.sheet_state == 'visible']
+    finally:
+        workbook.close()
+
+
+def _set_template_cell(sheet, address: str, value: Any) -> None:
+    if value is None or value == '':
+        return
+    cell = sheet[address]
+    if cell.__class__.__name__ == 'MergedCell':
+        raise ValueError(f'模板字段位置 {sheet.title}!{address} 是合并单元格中的非起始格。')
+    cell.value = value
+    cell.alignment = Alignment(
+        horizontal=cell.alignment.horizontal,
+        vertical=cell.alignment.vertical or 'center',
+        wrap_text=True,
+    )
+
+
+def _normalize_workbook_fonts(workbook, font_name: str = 'Arial') -> None:
+    for sheet in workbook.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.__class__.__name__ == 'MergedCell':
+                    continue
+                font = copy(cell.font)
+                font.name = font_name
+                cell.font = font
+                if isinstance(cell.value, str) and '\n' in cell.value:
+                    cell.alignment = Alignment(
+                        horizontal=cell.alignment.horizontal,
+                        vertical=cell.alignment.vertical or 'center',
+                        text_rotation=cell.alignment.text_rotation,
+                        wrap_text=True,
+                        shrink_to_fit=cell.alignment.shrink_to_fit,
+                        indent=cell.alignment.indent,
+                    )
+
+
+def _sheet_for_document(workbook, document_type: str):
+    target = 'COMMERCIAL INVOICE' if document_type == 'Commercial Invoice' else 'PACKING LIST'
+    for sheet in workbook.worksheets:
+        if target in sheet.title.upper():
+            return sheet
+    return None
+
+
+def _number(values: Dict[str, Any], key: str) -> float:
+    try:
+        return float(values.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fill_invoice_template(sheet, values: Dict[str, Any]) -> None:
+    currency = str(values.get('currency', ''))
+    gross_kg = _number(values, 'gross_weight')
+    net_kg = _number(values, 'net_weight')
+    gross_mt = gross_kg / 1000
+    net_mt = net_kg / 1000
+    cell_values = {
+        'K3': f"COMMERCIAL INVOICE NO.\n{values.get('document_no', '')}",
+        'A9': values.get('date', ''),
+        'G9': values.get('order_no', ''),
+        'K9': values.get('document_no', ''),
+        'A12': values.get('payment_terms', ''),
+        'G12': values.get('date', ''),
+        'K12': values.get('lc_no', ''),
+        'G15': values.get('destination_port', ''),
+        'K15': values.get('lc_issue_date', ''),
+        'A17': values.get('customer_name_en', ''),
+        'A18': values.get('customer_address', ''),
+        'A20': values.get('loading_port', ''),
+        'A26': values.get('product_code') or values.get('product_name_en', ''),
+        'B26': values.get('quantity', ''),
+        'C26': gross_mt,
+        'F26': values.get('product_description_en') or values.get('product_name_en', ''),
+        'I26': net_mt,
+        'L26': _number(values, 'unit_price'),
+        'N26': _number(values, 'total_amount'),
+        'A38': 'TOTAL',
+        'B38': f"{values.get('quantity', '')} {values.get('unit', '')}",
+        'C38': gross_mt,
+        'I38': net_mt,
+        'L38': values.get('incoterm', ''),
+        'N38': _number(values, 'total_amount'),
+        'A39': f"TOTAL AMOUNT: {currency} {_number(values, 'total_amount'):,.2f}",
+        'A40': f"AMOUNT IN WORDS: {amount_in_english_words(values.get('total_amount'), currency)}",
+    }
+    for address, value in cell_values.items():
+        _set_template_cell(sheet, address, value)
+    for address in ('N26', 'N38'):
+        cell = sheet[address]
+        cell.number_format = '#,##0.00'
+        cell.alignment = Alignment(
+            horizontal='right',
+            vertical='center',
+            shrink_to_fit=True,
+        )
+
+
+def _fill_packing_list_template(sheet, values: Dict[str, Any]) -> None:
+    gross_kg = _number(values, 'gross_weight')
+    net_kg = _number(values, 'net_weight')
+    gross_mt = gross_kg / 1000
+    net_mt = net_kg / 1000
+    cell_values = {
+        'F6': f"DATE: {values.get('date', '')}",
+        'A10': values.get('customer_name_en', ''),
+        'A11': values.get('customer_address', ''),
+        'C13': f"NO. {values.get('document_no', '')}",
+        'C14': values.get('order_no', ''),
+        'A18': 1,
+        'B18': values.get('product_name_en', ''),
+        'C18': values.get('packaging_method', ''),
+        'D18': net_mt,
+        'E18': net_kg,
+        'F18': gross_mt,
+        'G18': gross_kg,
+        'H18': values.get('product_specification', ''),
+        'B24': values.get('product_name_en', ''),
+        'B25': values.get('product_specification', ''),
+        'B27': values.get('packaging_method', ''),
+        'B29': values.get('hs_code', ''),
+        'B30': f'{net_mt:g} MT',
+        'B31': f'{net_kg:,.2f} KG',
+        'B32': f'{gross_mt:g} MT',
+        'B33': f'{gross_kg:,.2f} KG',
+    }
+    for address, value in cell_values.items():
+        _set_template_cell(sheet, address, value)
+    sheet.row_dimensions[10].height = max(sheet.row_dimensions[10].height or 0, 24)
+    sheet.row_dimensions[11].height = max(sheet.row_dimensions[11].height or 0, 42)
+    for row in range(24, 43):
+        cell = sheet.cell(row, 1)
+        if not isinstance(cell.value, str):
+            continue
+        cell.alignment = Alignment(
+            horizontal=cell.alignment.horizontal,
+            vertical='center',
+            wrap_text=True,
+        )
+        if len(cell.value) > 20:
+            sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height or 0, 30)
+
+
+def _export_using_template(
+    document_type: str,
+    values: Dict[str, Any],
+    output_path: Path,
+    template_path: str,
+) -> str:
+    source = Path(template_path)
+    if not source.exists():
+        raise FileNotFoundError(f'未找到所选 Excel 模板：{source}')
+    if source.suffix.lower() != '.xlsx':
+        raise ValueError('Excel 单证模板必须是 .xlsx 文件。')
+
+    workbook = load_workbook(source)
+    invoice_sheet = _sheet_for_document(workbook, 'Commercial Invoice')
+    packing_sheet = _sheet_for_document(workbook, 'Packing List')
+    if invoice_sheet is None and packing_sheet is None:
+        raise ValueError('所选 Excel 模板没有识别到 Commercial Invoice 或 Packing List 工作表。')
+
+    if document_type == 'Commercial Invoice' and invoice_sheet is not None:
+        _fill_invoice_template(invoice_sheet, values)
+    elif document_type == 'Packing List' and packing_sheet is not None:
+        _fill_packing_list_template(packing_sheet, values)
+
+    target_sheet = invoice_sheet if document_type == 'Commercial Invoice' else packing_sheet
+    if document_type in {'Commercial Invoice', 'Packing List'} and target_sheet is None:
+        workbook.close()
+        raise ValueError(f'所选 Excel 模板中没有识别到 {document_type} 工作表。')
+    workbook.calculation.fullCalcOnLoad = True
+    workbook.calculation.forceFullCalc = True
+    workbook.calculation.calcMode = 'auto'
+    target_sheet.page_setup.orientation = 'landscape'
+    target_sheet.page_setup.fitToWidth = 1
+    target_sheet.page_setup.fitToHeight = 1
+    target_sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    _normalize_workbook_fonts(workbook)
+    workbook.save(output_path)
+    workbook.close()
+    return str(output_path)
+
+
+def _section(sheet, row: int, title: str, end_column: int = 5) -> int:
+    sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=end_column)
+    cell = sheet.cell(row, 1, title.upper())
+    cell.fill = PatternFill('solid', fgColor=BLUE)
+    cell.font = Font(name='Arial', size=10, bold=True, color=WHITE)
+    cell.alignment = Alignment(vertical='center')
+    sheet.row_dimensions[row].height = 20
+    return row + 1
+
+
+def _label_value(sheet, row: int, pairs: list[tuple[str, Any]]) -> int:
+    column = 1
+    for label, value in pairs:
+        label_cell = sheet.cell(row, column, label)
+        label_cell.fill = PatternFill('solid', fgColor=PALE_BLUE)
+        label_cell.font = Font(name='Arial', size=9, bold=True, color=BLUE)
+        label_cell.alignment = Alignment(vertical='top', wrap_text=True)
+        value_cell = sheet.cell(row, column + 1, value)
+        value_cell.font = Font(name='Arial', size=9, color='243447')
+        value_cell.alignment = Alignment(vertical='top', wrap_text=True)
+        column += 2
+    sheet.row_dimensions[row].height = 30
+    return row + 1
+
+
+def _apply_table_borders(sheet, min_row: int, max_row: int, min_column: int, max_column: int) -> None:
+    side = Side(style='thin', color=GRID)
+    for row in sheet.iter_rows(min_row=min_row, max_row=max_row, min_col=min_column, max_col=max_column):
+        for cell in row:
+            cell.border = Border(left=side, right=side, top=side, bottom=side)
+
+
+def export_document_excel(
+    document_type: str,
+    values: Dict[str, Any],
+    output_path: str | None = None,
+    template_path: str | None = None,
+) -> str:
+    target = Path(output_path) if output_path else settings.outputs_dir / values.get('order_no', 'document') / f'{document_type}_export.xlsx'
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if template_path:
+        template_output = _export_using_template(document_type, values, target, template_path)
+        if template_output:
+            return template_output
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = document_type[:31]
+    sheet.sheet_view.showGridLines = False
+    sheet.merge_cells('A1:F1')
+    title = sheet['A1']
+    title.value = str(values.get('company_name', ''))
+    title.font = Font(name='Arial', size=16, bold=True, color=NAVY)
+    title.alignment = Alignment(horizontal='center')
+    sheet.merge_cells('A2:F2')
+    title = sheet['A2']
+    title.value = document_type.upper()
+    title.font = Font(name='Arial', size=14, bold=True, color=BLUE)
+    title.alignment = Alignment(horizontal='center')
+    sheet.row_dimensions[1].height = 26
+    sheet.row_dimensions[2].height = 24
+
+    row = _section(sheet, 4, 'Document Information')
+    row = _label_value(sheet, row, [
+        ('Document No.', values.get('document_no', '')),
+        ('Date', values.get('date', '')),
+        ('Order No.', values.get('order_no', '')),
+    ])
+    row = _section(sheet, row, 'Parties')
+    row = _label_value(sheet, row, [
+        ('Seller', f"{values.get('company_name', '')}\n{values.get('company_address', '')}"),
+        ('Buyer', f"{values.get('customer_name_en', '')}\n{values.get('customer_address', '')}"),
+    ])
+    row = _section(sheet, row, 'Shipment and Commercial Terms')
+    row = _label_value(sheet, row, [
+        ('Incoterm', values.get('incoterm', '')),
+        ('Currency', values.get('currency', '')),
+    ])
+    row = _label_value(sheet, row, [
+        ('Loading Port', values.get('loading_port', '')),
+        ('Destination Port', values.get('destination_port', '')),
+    ])
+    row = _label_value(sheet, row, [
+        ('Payment Terms', values.get('payment_terms', '')),
+        ('Shipment Date', values.get('shipment_date', '')),
+    ])
+
+    row = _section(sheet, row, 'Goods and Amount')
+    headers = ['No.', 'Description of Goods', 'Quantity', 'Unit Price', 'Amount', 'Currency']
+    for column, value in enumerate(headers, start=1):
+        cell = sheet.cell(row, column, value)
+        cell.fill = PatternFill('solid', fgColor=NAVY)
+        cell.font = Font(name='Arial', size=9, bold=True, color=WHITE)
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    row += 1
+    goods_row = row
+    goods = [
+        1,
+        values.get('product_name_en', ''),
+        f"{values.get('quantity', '')} {values.get('unit', '')}",
+        values.get('unit_price', ''),
+        values.get('total_amount', ''),
+        values.get('currency', ''),
+    ]
+    for column, value in enumerate(goods, start=1):
+        cell = sheet.cell(row, column, value)
+        cell.font = Font(name='Arial', size=9, color='243447')
+        cell.alignment = Alignment(vertical='top', wrap_text=True)
+    row += 1
+    if document_type == 'Packing List':
+        for label, value in [
+            ('Marks & Numbers', values.get('marks_and_numbers', '')),
+            ('Net Weight (kg)', values.get('net_weight', '')),
+            ('Gross Weight (kg)', values.get('gross_weight', '')),
+            ('Measurement (CBM)', values.get('volume', '')),
+        ]:
+            sheet.cell(row, 1, label)
+            sheet.cell(row, 2, value)
+            sheet.cell(row, 1).font = Font(name='Arial', size=9, bold=True, color=BLUE)
+            row += 1
+    else:
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        sheet.cell(row, 1, 'TOTAL CONTRACT / INVOICE AMOUNT')
+        sheet.cell(row, 5, values.get('total_amount', ''))
+        sheet.cell(row, 6, values.get('currency', ''))
+        sheet.cell(row, 1).font = Font(name='Arial', size=10, bold=True, color=NAVY)
+        sheet.cell(row, 5).font = Font(name='Arial', size=10, bold=True, color=NAVY)
+        row += 1
+    _apply_table_borders(sheet, goods_row - 1, row - 1, 1, 6)
+
+    row += 1
+    row = _section(sheet, row, 'Packing and Remarks')
+    row = _label_value(sheet, row, [
+        ('Marks & Numbers', values.get('marks_and_numbers', '')),
+        ('Remarks', values.get('remarks', '')),
+    ])
+    if values.get('lc_document_instruction'):
+        row = _section(sheet, row, 'Letter of Credit Requirements')
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        sheet.cell(row, 1, values['lc_document_instruction'])
+        sheet.cell(row, 1).alignment = Alignment(vertical='top', wrap_text=True)
+        sheet.cell(row, 1).font = Font(name='Arial', size=9, color='243447')
+        sheet.row_dimensions[row].height = max(30, 15 * str(values['lc_document_instruction']).count('\n') + 30)
+        row += 1
+
+    for column, width in enumerate([18, 34, 20, 18, 18, 15], start=1):
+        sheet.column_dimensions[get_column_letter(column)].width = width
+    sheet.freeze_panes = f'A{goods_row}'
+    sheet.auto_filter.ref = f'A{goods_row - 1}:F{goods_row}'
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.page_setup.fitToWidth = 1
+    sheet.page_setup.fitToHeight = 0
+    sheet.page_margins = PageMargins(left=0.25, right=0.25, top=0.5, bottom=0.5, header=0.2, footer=0.2)
+    sheet.print_title_rows = f'1:{goods_row - 1}'
+
+    workbook.save(target)
+    return str(target)
