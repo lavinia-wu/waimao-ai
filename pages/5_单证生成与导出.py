@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import re
 
@@ -19,8 +20,19 @@ from modules.documents import (
     list_excel_templates,
     list_word_templates,
 )
+from modules.document_validation import (
+    get_document_count_requirements,
+    validate_order_consistency,
+)
+from modules.lc_deadlines import render_lc_deadline_cards
+from modules.lc_parser import get_lc_by_order, get_lc_risks
 from modules.orders import list_orders
 from services.word_service import ensure_default_template
+from modules.workflow_navigation import (
+    build_workflow_statuses,
+    render_section_next_step,
+    render_workflow_progress,
+)
 
 
 st.set_page_config(layout='wide')
@@ -98,12 +110,27 @@ st.caption('系统内置 Word 模板与客户模板分开存放；生成文件�
 
 orders = list_orders(owner_id=owner_id)
 order_map = {f"{order['order_no']} | {order.get('customer_name_cn', '')} | {order.get('product_name_en', '')}": order['id'] for order in orders}
-selected_order_label = st.selectbox('选择订单', options=list(order_map.keys()) or ['暂无订单'])
+order_labels = list(order_map.keys()) or ['暂无订单']
+previous_order_id = st.session_state.get('workflow_current_order_id')
+selected_index = next(
+    (
+        index for index, label in enumerate(order_labels)
+        if order_map.get(label) == previous_order_id
+    ),
+    0,
+)
+selected_order_label = st.selectbox(
+    '选择订单',
+    options=order_labels,
+    index=selected_index,
+    key='document_selected_order_label',
+)
 selected_order_id = order_map.get(selected_order_label)
 
 if selected_order_id is None:
     st.warning('请先在“订单录入与计算”页面创建订单。')
     st.stop()
+st.session_state['workflow_current_order_id'] = selected_order_id
 selected_order = next((order for order in orders if order['id'] == selected_order_id), None)
 workflow_labels = {
     'order_confirmed': '订单已确认，待关联信用证/生成单证',
@@ -113,6 +140,49 @@ workflow_labels = {
     'pdf_confirmed': '业务员已确认 PDF 版本',
 }
 st.info(f"当前订单状态：{workflow_labels.get((selected_order or {}).get('workflow_status'), '处理中')}")
+lc_record = get_lc_by_order(selected_order_id, owner_id)
+if lc_record:
+    st.session_state['workflow_current_lc_id'] = lc_record['id']
+current_risks = get_lc_risks(lc_record['id']) if lc_record else []
+high_risk_open = any(
+    str(risk.get('risk_level') or '').strip().casefold() in {'高', 'high', 'critical'}
+    and risk.get('handling_status') not in {'已确认可接受', '已整改'}
+    for risk in current_risks
+)
+previous_consistency = st.session_state.get(
+    f'workflow_consistency_{selected_order_id}'
+)
+render_workflow_progress(
+    build_workflow_statuses(
+        selected_order,
+        lc_record,
+        high_risk_open=high_risk_open,
+        consistency=previous_consistency,
+    ),
+    '当前订单存在未处理高风险信用证条款；请查看下方风险与校验信息。'
+    if high_risk_open else None,
+)
+workflow_status = (selected_order or {}).get('workflow_status')
+if workflow_status not in {'documents_ready_for_review', 'pdf_confirmed'}:
+    render_section_next_step('下一步：前往单证生成', 'document-generation')
+elif previous_consistency and not previous_consistency.get('blockers') and not previous_consistency.get('needs_review') and not previous_consistency.get('warnings'):
+    render_section_next_step('下一步：前往 PDF 导出', 'pdf-export')
+else:
+    render_section_next_step('下一步：前往单单一致性校验', 'consistency-check')
+if previous_consistency and previous_consistency.get('blockers'):
+    st.warning('上次一致性校验发现高风险错误；仍可继续查看和处理，PDF门禁保持原有规则。')
+st.divider()
+if lc_record:
+    try:
+        parsed_lc = json.loads(lc_record.get('parsed_json') or '{}')
+    except json.JSONDecodeError:
+        parsed_lc = {}
+    st.subheader('信用证关键期限')
+    render_lc_deadline_cards(parsed_lc, selected_order)
+else:
+    parsed_lc = {}
+    st.warning('当前订单尚未关联已确认的信用证；关键期限显示待核对。')
+    render_lc_deadline_cards({})
 
 doc_type = st.selectbox('单证类型', DOCUMENT_TYPES)
 supported_upload_types = ['docx', 'xlsx'] if doc_type in {'Commercial Invoice', 'Packing List'} else ['docx']
@@ -177,6 +247,89 @@ st.warning(
     '正式出单前请核对并更新这些字段。'
 )
 
+st.markdown('<div id="consistency-check"></div>', unsafe_allow_html=True)
+st.subheader('单单一致性校验')
+st.caption('比较已确认信用证、订单及最新生成的 PI、Commercial Invoice、Packing List、Sales Contract。')
+requirements = get_document_count_requirements(selected_order_id)
+prepared_counts = {}
+if requirements:
+    st.markdown('**L/C 单据份数要求**')
+    st.caption('请确认本次按信用证要求备妥的正本/副本份数；系统生成电子文件不等同于实体签章份数。')
+    for requirement in requirements:
+        original_col, copy_col = st.columns([1, 1])
+        with original_col:
+            original_count = st.number_input(
+                f"{requirement['document_type']} · 正本（要求 {requirement['original_count']} 份）",
+                min_value=0,
+                step=1,
+                value=0,
+                key=(
+                    f"prepared_originals_{selected_order_id}_"
+                    f"{requirement['lc_id']}_{requirement['key']}"
+                ),
+            )
+        with copy_col:
+            copy_count = st.number_input(
+                f"{requirement['document_type']} · 副本（要求 {requirement['copy_count']} 份）",
+                min_value=0,
+                step=1,
+                value=0,
+                key=(
+                    f"prepared_copies_{selected_order_id}_"
+                    f"{requirement['lc_id']}_{requirement['key']}"
+                ),
+            )
+        prepared_counts[requirement['key']] = {
+            'original_count': int(original_count),
+            'copy_count': int(copy_count),
+        }
+else:
+    st.error('待核对：未识别到信用证单据份数要求，请人工核对信用证原文。')
+
+consistency = validate_order_consistency(selected_order_id, prepared_counts)
+st.session_state[f'workflow_consistency_{selected_order_id}'] = {
+    'blockers': consistency['blockers'],
+    'needs_review': consistency['needs_review'],
+    'warnings': consistency['warnings'],
+}
+if consistency['blockers']:
+    st.error('发现明确的高风险不一致；处理完成前将阻止 PDF 生成。')
+    for blocker in consistency['blockers']:
+        st.error(f"**{blocker['field']}**：{'；'.join(blocker['reasons'])}")
+if consistency['needs_review']:
+    st.warning('请人工核对以下项目。系统无法从当前数据或自定义模板中可靠提取/比较这些字段；此状态本身不会阻止 PDF。')
+    for item in consistency['needs_review']:
+        st.markdown(f"- **{item['field']}**：{'；'.join(item['reasons'])}")
+if consistency['warnings']:
+    with st.expander(f"查看缺失或提示项（{len(consistency['warnings'])}）"):
+        for item in consistency['warnings']:
+            st.caption(f"{item['field']}：{'；'.join(item['reasons'])}")
+
+status_labels = {
+    'passed': '一致',
+    'warning': '提示',
+    'needs_review': '请人工核对',
+    'error': '明确不一致',
+    'missing': '缺失',
+}
+consistency_rows = []
+for item in consistency['rows']:
+    values = item['values']
+    consistency_rows.append({
+        '校验字段': item['label'],
+        '信用证': values.get('信用证') if values.get('信用证') not in (None, '') else '待核对',
+        '订单': values.get('订单') if values.get('订单') not in (None, '') else '待核对',
+        'PI': values.get('PI') if values.get('PI') not in (None, '') else '待核对',
+        'Commercial Invoice': values.get('Commercial Invoice') if values.get('Commercial Invoice') not in (None, '') else '待核对',
+        'Packing List': values.get('Packing List') if values.get('Packing List') not in (None, '') else '待核对',
+        'Sales Contract': values.get('Sales Contract') if values.get('Sales Contract') not in (None, '') else '待核对',
+        '严重等级': item['severity'],
+        '结果': status_labels.get(item['status'], item['status']),
+        '说明': '；'.join(item['details']),
+    })
+st.dataframe(consistency_rows, hide_index=True, use_container_width=True)
+
+st.markdown('<div id="document-generation"></div>', unsafe_allow_html=True)
 if st.button('生成当前单证', use_container_width=True):
     try:
         results = generate_document(
@@ -211,15 +364,24 @@ if st.button('批量生成四单', use_container_width=True):
     except Exception as exc:
         st.error(f'四单生成失败：{exc}')
 
+st.markdown('<div id="pdf-export"></div>', unsafe_allow_html=True)
 st.subheader('复核确认后生成 PDF')
 st.caption('PDF 由已生成的 Word/Excel 文件转换，保留各自模板版式；请确保本机已安装 Microsoft Office。')
 pdf_confirmed = st.checkbox(
     '我已逐份核对当前订单的 Word/Excel 单证内容，确认无误。',
     key=f'confirm_documents_{selected_order_id}',
 )
-if st.button('确认无误，生成全部 PDF', disabled=not pdf_confirmed, use_container_width=True):
+if st.button(
+    '确认无误，生成全部 PDF',
+    disabled=not pdf_confirmed or bool(consistency['blockers']),
+    use_container_width=True,
+):
     try:
-        pdf_results = generate_pdfs_for_order(selected_order_id)
+        with st.spinner('正在将四种单证排版为单页 A4 PDF，请稍候…'):
+            pdf_results = generate_pdfs_for_order(
+                selected_order_id,
+                prepared_counts=prepared_counts,
+            )
         st.success('四份 PDF 已生成；原有 Word/Excel 文件已保留。')
         for document_name, file_path in pdf_results.items():
             with open(file_path, 'rb') as fh:

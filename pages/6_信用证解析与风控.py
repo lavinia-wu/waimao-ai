@@ -3,24 +3,165 @@ from __future__ import annotations
 import json
 import hashlib
 
+import pandas as pd
 import streamlit as st
 from PIL import UnidentifiedImageError
 
 from modules.auth import require_authenticated_user
+from modules.lc_deadlines import parse_date, render_lc_deadline_cards
+from modules.lc_confirmation import (
+    FIELD_GROUPS,
+    build_change_summary,
+    merge_confirmed_values,
+    normalize_field_value,
+    source_excerpts,
+    validate_confirmation,
+)
 from modules.lc_parser import (
     analyze_lc_clauses,
     build_lc_summary,
     extract_lc_text,
+    get_lc_risks,
+    get_lc_by_order,
+    list_approved_lcs,
     parse_lc_text,
     save_lc_record,
     translate_lc_text,
+    update_lc_risk_handling,
+    RISK_HANDLING_STATUSES,
 )
+from modules.orders import get_order_by_id
+from modules.workflow_navigation import (
+    build_workflow_statuses,
+    render_page_next_step,
+    render_workflow_progress,
+)
+
+
+def risk_sort_key(item):
+    level = str(item.get('risk_level', '')).strip().casefold()
+    return {
+        '高': 0, 'high': 0, 'critical': 0,
+        '中': 1, 'medium': 1,
+        '低': 2, 'low': 2,
+    }.get(level, 1)
+
+
+def risk_widget_key(item):
+    clause = str(item.get('original_clause_en') or '')
+    return hashlib.sha256(clause.encode('utf-8')).hexdigest()[:12]
+
+
+def table_cell(value):
+    return '' if pd.isna(value) else value
+
+
+def normalized_count(value):
+    value = table_cell(value)
+    if value in (None, ''):
+        return ''
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value).strip()
+    return int(numeric) if numeric.is_integer() else numeric
+
+
+def shown_count(value):
+    normalized = normalized_count(value)
+    return '未明确' if normalized == '' else normalized
+
+
+def risks_for_save(risks):
+    updated = []
+    for item in risks:
+        if not isinstance(item, dict):
+            continue
+        risk = dict(item)
+        key = f"{st.session_state.get('lc_upload_digest', 'preview')}_{risk_widget_key(risk)}"
+        risk['handling_level'] = (
+            '必须处理' if risk.get('risk_level') == '高'
+            else '一般提示' if risk.get('risk_level') == '低'
+            else '需确认'
+        )
+        risk['handling_status'] = st.session_state.get(
+            f'preview_risk_status_{key}',
+            risk.get('handling_status', '未处理'),
+        )
+        risk['handling_note'] = st.session_state.get(
+            f'preview_risk_note_{key}',
+            risk.get('handling_note', ''),
+        )
+        updated.append(risk)
+    return updated
+
+
+def render_risk_details(item, index):
+    level = str(item.get('risk_level') or '中')
+    heading = f"{index}. [{level}风险] {item.get('risk_type') or '信用证条款风险'}"
+    if level.casefold() in {'高', 'high', 'critical'}:
+        st.error(heading)
+    elif level.casefold() in {'中', 'medium'}:
+        st.warning(heading)
+    else:
+        st.info(heading)
+    st.markdown(f"**处理分级：** {item.get('handling_level') or ('必须处理' if level == '高' else '一般提示' if level == '低' else '需确认')}")
+    st.markdown(f"**英文原文：** {item.get('original_clause_en') or '—'}")
+    st.markdown(f"**中文翻译：** {item.get('clause_translation_cn') or '—'}")
+    st.markdown(f"**风险解释：** {item.get('risk_explanation_cn') or '—'}")
+    st.markdown(f"**整改建议：** {item.get('suggested_action_cn') or '—'}")
+    affected = item.get('affected_documents') or []
+    if isinstance(affected, str):
+        affected = [part.strip() for part in affected.split(',') if part.strip()]
+    st.markdown(f"**受影响单据：** {', '.join(affected) if affected else '待确认'}")
+
+
 st.set_page_config(layout='wide')
 owner_id = int(require_authenticated_user()['id'])
 
 st.title('信用证解析、条款分析与翻译')
 st.caption('先上传并确认信用证最终版本，再识别录入订单；信用证在订单确认时关联，并自动生成交单提醒。')
 st.info('信用证文本会发送到 .env 配置的 AI 服务；若本机 OCR 不可用，图片也会发送给支持视觉的 AI 服务。分析结果请人工核对后再同步。')
+
+approved_lcs = list_approved_lcs(owner_id)
+current_order_id = st.session_state.get('workflow_current_order_id')
+current_order = (
+    get_order_by_id(current_order_id, owner_id)
+    if current_order_id is not None
+    else None
+)
+current_lc_id = st.session_state.get('workflow_current_lc_id')
+current_lc = next(
+    (item for item in approved_lcs if item.get('id') == current_lc_id),
+    None,
+)
+if current_lc is None and current_order:
+    linked_lc = get_lc_by_order(current_order['id'], owner_id)
+    current_lc = next(
+        (
+            item for item in approved_lcs
+            if linked_lc and item.get('id') == linked_lc.get('id')
+        ),
+        None,
+    )
+current_risks = get_lc_risks(current_lc['id']) if current_lc else []
+high_risk_open = any(
+    str(risk.get('risk_level') or '').strip().casefold() in {'高', 'high', 'critical'}
+    and risk.get('handling_status') not in {'已确认可接受', '已整改'}
+    for risk in current_risks
+)
+render_workflow_progress(
+    build_workflow_statuses(
+        current_order,
+        current_lc,
+        high_risk_open=high_risk_open,
+        lc_preview=bool(st.session_state.get('lc_analysis_preview')),
+    ),
+    '当前信用证存在未处理的高风险条款；可继续前往订单录入，建议先核对并处理风险。'
+    if high_risk_open else None,
+)
+render_page_next_step('下一步：前往订单录入', 'pages/4_订单录入与计算.py')
+st.divider()
 
 uploaded_file = st.file_uploader('上传信用证文件或图片', type=['pdf', 'png', 'jpg', 'jpeg'])
 if 'lc_analysis_preview' not in st.session_state:
@@ -59,6 +200,63 @@ if uploaded_file is not None and st.button('识别、分析并翻译', type='pri
     except (ValueError, RuntimeError, OSError, UnidentifiedImageError) as exc:
         st.error(f'处理失败：{exc}')
 
+if approved_lcs:
+    st.subheader('已确认信用证风险处理')
+    lc_options = {
+        f"{item['lc_no']} · {item.get('applicant') or '申请人未填写'} · ID {item['id']}": item['id']
+        for item in approved_lcs
+    }
+    selected_risk_lc = st.selectbox(
+        '选择已确认信用证',
+        list(lc_options),
+        key='risk_management_lc',
+    )
+    selected_lc_id = lc_options[selected_risk_lc]
+    st.session_state['workflow_current_lc_id'] = selected_lc_id
+    saved_risks = sorted(get_lc_risks(selected_lc_id), key=risk_sort_key)
+    if not saved_risks:
+        st.success('该信用证没有已识别的风险条款。')
+    for risk_index, risk in enumerate(saved_risks, start=1):
+        with st.expander(
+            f"[{risk.get('risk_level', '中')}风险] {risk.get('risk_type') or '信用证条款风险'}",
+            expanded=risk.get('risk_level') == '高' and risk.get('handling_status') == '未处理',
+        ):
+            render_risk_details(risk, risk_index)
+            st.caption(
+                f"当前状态：{risk.get('handling_status') or '未处理'} · "
+                f"处理时间：{risk.get('handled_at') or '尚未处理'}"
+            )
+            with st.form(f"save_lc_risk_{risk['id']}"):
+                current_status = risk.get('handling_status') or '未处理'
+                status_index = (
+                    RISK_HANDLING_STATUSES.index(current_status)
+                    if current_status in RISK_HANDLING_STATUSES else 0
+                )
+                updated_status = st.selectbox(
+                    '处理状态',
+                    RISK_HANDLING_STATUSES,
+                    index=status_index,
+                    key=f"risk_status_{risk['id']}",
+                )
+                updated_note = st.text_area(
+                    '处理备注',
+                    value=risk.get('handling_note') or '',
+                    key=f"risk_note_{risk['id']}",
+                )
+                save_risk = st.form_submit_button('保存处理记录')
+            if save_risk:
+                try:
+                    update_lc_risk_handling(
+                        risk['id'],
+                        updated_status,
+                        updated_note,
+                        owner_id,
+                    )
+                    st.success('风险处理状态、备注和处理时间已保存。')
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(f'保存风险处理记录失败：{exc}')
+
 preview = st.session_state.get('lc_analysis_preview')
 if preview:
     st.caption(f"当前分析文件：{preview['filename']}")
@@ -68,21 +266,45 @@ if preview:
     analysis = preview.get('analysis')
     if analysis:
         parsed = preview['parsed']
+        st.subheader('信用证关键期限')
         st.subheader('关键信息摘要')
         st.text(build_lc_summary(parsed))
         with st.expander('结构化字段'):
             st.json(parsed)
 
         st.subheader('不利或需重点关注的条款')
-        adverse_clauses = analysis['adverse_clauses']
+        adverse_clauses = sorted(analysis['adverse_clauses'], key=risk_sort_key)
         if adverse_clauses:
             for index, item in enumerate(adverse_clauses, start=1):
-                st.markdown(f"**{index}. [{item['risk_level']}风险] {item['risk_type']}**")
-                st.markdown(f"- 信用证原文：{item['original_clause_en']}")
-                st.markdown(f"- 风险说明：{item['risk_explanation_cn']}")
-                st.markdown(f"- 建议：{item['suggested_action_cn']}")
-                if item['affected_documents']:
-                    st.markdown(f"- 可能影响单据：{', '.join(item['affected_documents'])}")
+                item['handling_level'] = (
+                    '必须处理' if item.get('risk_level') == '高'
+                    else '一般提示' if item.get('risk_level') == '低'
+                    else '需确认'
+                )
+                render_risk_details(item, index)
+                risk_key = (
+                    f"{st.session_state.get('lc_upload_digest', 'preview')}_"
+                    f"{risk_widget_key(item)}"
+                )
+                status = st.selectbox(
+                    '处理状态',
+                    RISK_HANDLING_STATUSES,
+                    index=0,
+                    key=f'preview_risk_status_{risk_key}',
+                )
+                note = st.text_area(
+                    '处理备注',
+                    key=f'preview_risk_note_{risk_key}',
+                    placeholder='记录核对结论、客户反馈或信用证修改情况',
+                )
+                item['handling_status'] = status
+                item['handling_note'] = note
+                item['handled_at'] = (
+                    '确认信用证时由系统记录'
+                    if status != '未处理' or note.strip()
+                    else '尚未处理'
+                )
+                st.caption(f"处理时间：{item['handled_at']}")
         else:
             st.success('未识别到明显不利条款；仍建议人工核对信用证原文。')
 
@@ -107,46 +329,327 @@ if preview:
             st.warning('未从信用证中识别到明确的单据份数要求，请人工核对原文。')
 
         st.subheader('确认信用证最终版本')
-        st.caption('请核对原文、中文翻译、结构化字段、不利条款及单据份数。确认保存后，此版本不可由系统自动改写。')
-        with st.form('approve_lc_form'):
-            final_translation = st.text_area(
-                '信用证中文翻译（可修改）',
-                value=preview.get('translation', ''),
-                height=320,
+        st.caption('逐组核对 AI 识别值并确认人工值；保存前会展示变更摘要并进行结构化校验。')
+        form_digest = st.session_state.get('lc_upload_digest', 'preview')
+        confirmed_values = {}
+        for group_title, fields in FIELD_GROUPS:
+            with st.expander(group_title, expanded=True):
+                for field, label, kind, required, aliases in fields:
+                    ai_value = parsed.get(field)
+                    widget_key = f'lc_confirm_{form_digest}_{field}'
+                    st.markdown(f"**{label}{'（必填）' if required else ''}**")
+                    ai_col, confirmed_col, state_col = st.columns([1, 1, 1])
+                    normalized_ai = normalize_field_value(field, kind, ai_value)
+                    with ai_col:
+                        st.caption('AI识别值')
+                        st.write(
+                            normalized_ai
+                            if normalized_ai not in (None, '')
+                            else '未识别'
+                        )
+                    with confirmed_col:
+                        st.caption('人工确认值')
+                        if kind == 'date':
+                            initial_date = parse_date(ai_value)
+                            if ai_value not in (None, '') and initial_date is None:
+                                st.warning(f'AI 日期无法识别：{ai_value}')
+                            human_value = st.date_input(
+                                label,
+                                value=initial_date,
+                                key=widget_key,
+                                format='YYYY/MM/DD',
+                                label_visibility='collapsed',
+                            )
+                        elif kind == 'number':
+                            initial_number = (
+                                float(normalized_ai)
+                                if isinstance(normalized_ai, (int, float))
+                                else None
+                            )
+                            human_value = st.number_input(
+                                label,
+                                value=initial_number,
+                                min_value=0.0,
+                                step=0.01 if field in {'lc_amount', 'unit_price', 'tolerance_percentage'} else 1.0,
+                                key=widget_key,
+                                placeholder='请输入数值',
+                                label_visibility='collapsed',
+                            )
+                        elif kind == 'boolean':
+                            boolean_options = (
+                                ['待核对', 'Yes', 'No']
+                                if normalized_ai == ''
+                                else ['Yes', 'No']
+                            )
+                            initial_boolean = (
+                                normalized_ai
+                                if normalized_ai
+                                else '待核对'
+                            )
+                            selected_boolean = st.selectbox(
+                                label,
+                                boolean_options,
+                                index=boolean_options.index(initial_boolean),
+                                key=widget_key,
+                                label_visibility='collapsed',
+                            )
+                            human_value = selected_boolean
+                        elif kind == 'multiline':
+                            human_value = st.text_area(
+                                label,
+                                value=str(ai_value or ''),
+                                key=widget_key,
+                                label_visibility='collapsed',
+                                height=90,
+                            )
+                        else:
+                            human_value = st.text_input(
+                                label,
+                                value=str(ai_value or ''),
+                                key=widget_key,
+                                label_visibility='collapsed',
+                            )
+                    confirmed_values[field] = human_value
+                    normalized_human = normalize_field_value(field, kind, human_value)
+                    if required and normalized_human in (None, ''):
+                        field_status = '缺少必填值'
+                    elif (
+                        kind == 'date'
+                        and human_value not in (None, '')
+                        and not parse_date(human_value)
+                    ):
+                        field_status = '日期格式无效'
+                    elif (
+                        kind == 'number'
+                        and normalized_ai not in (None, '')
+                        and not isinstance(normalized_ai, (int, float))
+                        and human_value is None
+                    ):
+                        field_status = 'AI数值无法识别，待人工填写'
+                    elif kind == 'number' and human_value is not None and normalize_field_value(field, kind, human_value) == human_value and not isinstance(human_value, (int, float)):
+                        field_status = '数值格式无效'
+                    elif normalized_human != normalized_ai:
+                        field_status = '已人工修改'
+                    else:
+                        field_status = '格式有效，待确认'
+                    original_excerpt, translated_excerpt = source_excerpts(
+                        preview.get('raw_text', ''),
+                        preview.get('translation', ''),
+                        field,
+                        ai_value,
+                    )
+                    with state_col:
+                        st.caption('字段校验状态')
+                        st.write(field_status)
+                        st.caption(
+                            '数据来源：人工确认值'
+                            if normalized_human != normalized_ai
+                            else '数据来源：AI识别 / 信用证原文'
+                        )
+                    with st.expander(f'{label} · 原文与中文翻译', expanded=False):
+                        source_col, translation_col = st.columns(2)
+                        with source_col:
+                            st.caption('英文原文')
+                            st.text(original_excerpt)
+                        with translation_col:
+                            st.caption('中文翻译')
+                            st.text(translated_excerpt)
+
+        deadline_values = merge_confirmed_values(parsed, confirmed_values, [])
+        render_lc_deadline_cards(deadline_values)
+
+        st.markdown('**单据要求组**')
+        source_requirements = parsed.get('documents_required') or []
+        document_editor_rows = [
+            {
+                '_source_index': index,
+                '单据类型': item.get('document_type', ''),
+                '正本份数': item.get('original_count'),
+                '副本份数': item.get('copy_count'),
+                '特殊要求': item.get('special_requirements') or item.get('requirements') or '',
+            }
+            for index, item in enumerate(source_requirements)
+            if isinstance(item, dict)
+        ]
+        document_editor_data = st.data_editor(
+            pd.DataFrame(
+                document_editor_rows,
+                columns=['_source_index', '单据类型', '正本份数', '副本份数', '特殊要求'],
+            ),
+            column_config={
+                '_source_index': None,
+                '单据类型': st.column_config.TextColumn('单据类型', required=True),
+                '正本份数': st.column_config.NumberColumn(
+                    '正本份数', min_value=0, step=1, format='%d'
+                ),
+                '副本份数': st.column_config.NumberColumn(
+                    '副本份数', min_value=0, step=1, format='%d'
+                ),
+                '特殊要求': st.column_config.TextColumn('特殊要求'),
+            },
+            num_rows='dynamic',
+            hide_index=True,
+            key=f'lc_document_requirements_{form_digest}',
+        )
+        document_rows = document_editor_data.to_dict(orient='records')
+        st.caption('数据来源：信用证原文及 AI 条款分析；空白份数表示原文未明确。')
+        document_source_rows = []
+        for row_index, row in enumerate(document_rows):
+            source_index = row.get('_source_index')
+            try:
+                ai_requirement = source_requirements[int(source_index)]
+            except (ValueError, TypeError, IndexError):
+                ai_requirement = {}
+            original_excerpt, translated_excerpt = source_excerpts(
+                preview.get('raw_text', ''),
+                preview.get('translation', ''),
+                'documents_required',
+                ai_requirement.get('document_type'),
             )
-            final_parsed_json = st.text_area(
-                '最终结构化信用证信息（JSON，可修改）',
-                value=json.dumps(parsed, ensure_ascii=False, indent=2),
-                height=320,
+            ai_values = (
+                f"{ai_requirement.get('document_type', '未识别')} · "
+                f"正本 {ai_requirement.get('original_count', '未明确')} / "
+                f"副本 {ai_requirement.get('copy_count', '未明确')} · "
+                f"{ai_requirement.get('special_requirements') or ai_requirement.get('requirements') or ''}"
             )
-            confirmed = st.checkbox('我已逐项核对信用证原文、翻译和条款分析，确认该版本可用于订单执行。')
-            save_final = st.form_submit_button('确认最终版本并保存待关联信用证', type='primary')
+            confirmed_doc_type = str(table_cell(row.get('单据类型')) or '').strip()
+            changed = (
+                confirmed_doc_type != str(ai_requirement.get('document_type') or '')
+                or normalized_count(row.get('正本份数')) != normalized_count(ai_requirement.get('original_count'))
+                or normalized_count(row.get('副本份数')) != normalized_count(ai_requirement.get('copy_count'))
+                or str(table_cell(row.get('特殊要求')) or '') != str(
+                    ai_requirement.get('special_requirements')
+                    or ai_requirement.get('requirements')
+                    or ''
+                )
+            )
+            row_errors = [
+                error for error in validate_confirmation({}, [row])
+                if error.startswith('单据要求第')
+            ]
+            document_status = (
+                '校验错误：' + '；'.join(row_errors)
+                if row_errors
+                else '已修改' if changed else '格式有效，未修改'
+            )
+            document_source_rows.append({
+                '字段名': f"单据要求 · {confirmed_doc_type or f'第{row_index + 1}行'}",
+                '英文原文': original_excerpt,
+                '中文翻译': translated_excerpt,
+                'AI识别值': ai_values if ai_requirement else '未识别',
+                '人工确认值': (
+                    f"{confirmed_doc_type} · 正本 {shown_count(row.get('正本份数'))} / "
+                    f"副本 {shown_count(row.get('副本份数'))} · "
+                    f"{table_cell(row.get('特殊要求')) or ''}"
+                ),
+                '字段校验状态': document_status,
+                '数据来源': '人工确认值' if changed else 'AI条款分析 / 信用证原文',
+            })
+        if document_source_rows:
+            st.dataframe(
+                pd.DataFrame(document_source_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+        final_translation = st.text_area(
+            '信用证中文翻译（可修改）',
+            value=preview.get('translation', ''),
+            key=f'lc_translation_{form_digest}',
+            height=220,
+        )
+        final_parsed_preview = merge_confirmed_values(
+            parsed,
+            confirmed_values,
+            document_rows,
+        )
+        final_parsed_preview['adverse_clauses'] = risks_for_save(
+            parsed.get('adverse_clauses', adverse_clauses)
+        )
+
+        st.subheader('保存前变更摘要')
+        change_summary = build_change_summary(parsed, confirmed_values)
+        for row_index, row in enumerate(document_rows):
+            source_index = row.get('_source_index')
+            try:
+                ai_requirement = source_requirements[int(source_index)]
+            except (ValueError, TypeError, IndexError):
+                ai_requirement = {}
+            current_doc_type = str(table_cell(row.get('单据类型')) or '').strip()
+            ai_doc = ai_requirement.get('document_type', '')
+            ai_count = (
+                f"{normalized_count(ai_requirement.get('original_count'))} / "
+                f"{normalized_count(ai_requirement.get('copy_count'))}"
+            )
+            human_count = (
+                f"{normalized_count(row.get('正本份数'))} / "
+                f"{normalized_count(row.get('副本份数'))}"
+            )
+            changed = (
+                current_doc_type != ai_doc
+                or normalized_count(row.get('正本份数')) != normalized_count(ai_requirement.get('original_count'))
+                or normalized_count(row.get('副本份数')) != normalized_count(ai_requirement.get('copy_count'))
+                or str(table_cell(row.get('特殊要求')) or '') != str(
+                    ai_requirement.get('special_requirements')
+                    or ai_requirement.get('requirements')
+                    or ''
+                )
+            )
+            change_summary.append({
+                '字段名': f'单据要求 · {current_doc_type or f"第{row_index + 1}行"}',
+                'AI识别值': f'{ai_doc} · 正本/副本 {ai_count}',
+                '人工修改值': (
+                    f"{current_doc_type} · 正本/副本 {human_count} · "
+                    f"{table_cell(row.get('特殊要求')) or ''}"
+                ),
+                '是否修改': '是' if changed else '否',
+            })
+        st.dataframe(pd.DataFrame(change_summary), hide_index=True, use_container_width=True)
+
+        validation_errors = validate_confirmation(confirmed_values, document_rows)
+        if not final_translation.strip():
+            validation_errors.append('请确认并保存信用证中文翻译。')
+        if validation_errors:
+            st.error('结构化校验未通过：\n\n' + '\n'.join(f'- {error}' for error in validation_errors))
+
+        with st.expander('高级 JSON 视图（只读）'):
+            st.code(json.dumps(final_parsed_preview, ensure_ascii=False, indent=2), language='json')
+
+        confirmed = st.checkbox(
+            '我已逐项核对信用证原文、翻译、分组字段和单据要求，确认该版本可用于订单执行。',
+            key=f'lc_final_confirmed_{form_digest}',
+        )
+        save_final = st.button(
+            '确认最终版本并保存待关联信用证',
+            type='primary',
+            disabled=bool(validation_errors),
+        )
         if save_final:
             if not confirmed:
                 st.error('请先勾选确认。')
             else:
                 try:
-                    final_parsed = json.loads(final_parsed_json)
-                    if not isinstance(final_parsed, dict):
-                        raise ValueError('结构化信息必须是 JSON 对象。')
-                    if not final_translation.strip():
-                        raise ValueError('请确认并保存信用证中文翻译。')
-                    requirements = final_parsed.get('documents_required')
-                    if requirements is not None and not isinstance(requirements, list):
-                        raise ValueError('documents_required 必须为数组。')
                     lc_id = save_lc_record(
                         None,
-                        final_parsed,
+                        final_parsed_preview,
                         preview['raw_text'],
-                        final_parsed.get('adverse_clauses', analysis['adverse_clauses']),
+                        final_parsed_preview['adverse_clauses'],
                         translation_text=final_translation,
                         owner_id=owner_id,
                         approved_by=owner_id,
                     )
+                    st.session_state['workflow_current_lc_id'] = lc_id
+                    for key in list(st.session_state.keys()):
+                        if str(key).startswith(f'lc_confirm_{form_digest}_') or str(key).startswith(
+                            f'preview_risk_'
+                        ):
+                            st.session_state.pop(key, None)
+                    st.session_state.pop(f'lc_document_requirements_{form_digest}', None)
+                    st.session_state.pop(f'lc_translation_{form_digest}', None)
+                    st.session_state.pop(f'lc_final_confirmed_{form_digest}', None)
                     st.session_state.pop('lc_analysis_preview', None)
                     st.session_state.pop('lc_upload_digest', None)
                     st.success(f'信用证最终版本已确认保存（记录 ID：{lc_id}）。下一步请识别录入订单并关联该信用证。')
-                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                except (ValueError, TypeError) as exc:
                     st.error(f'无法保存信用证最终版本：{exc}')
     else:
         st.info('原文已提取。请配置 AI 服务后点击“识别、分析并翻译”以继续分析。')

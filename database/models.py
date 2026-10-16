@@ -140,6 +140,10 @@ CREATE_TABLES = [
         clause_translation_cn TEXT,
         risk_explanation_cn TEXT,
         suggested_action_cn TEXT,
+        handling_level TEXT NOT NULL DEFAULT '需确认',
+        handling_status TEXT NOT NULL DEFAULT '未处理',
+        handling_note TEXT NOT NULL DEFAULT '',
+        handled_at TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """,

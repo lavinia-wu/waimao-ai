@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from copy import copy
+from datetime import datetime
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict
 
 from openpyxl import Workbook, load_workbook
@@ -76,6 +79,35 @@ def _normalize_workbook_fonts(workbook, font_name: str = 'Arial') -> None:
                     )
 
 
+def _save_workbook_safely(workbook, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f'.{output_path.stem}_',
+        suffix=output_path.suffix,
+        dir=output_path.parent,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        workbook.save(temporary_path)
+        try:
+            os.replace(temporary_path, output_path)
+            return output_path
+        except PermissionError as exc:
+            if not output_path.exists():
+                raise PermissionError(
+                    f'无法写入 {output_path}，请检查文件夹权限。'
+                ) from exc
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            versioned_path = output_path.with_name(
+                f'{output_path.stem}_v{timestamp}{output_path.suffix}'
+            )
+            os.replace(temporary_path, versioned_path)
+            return versioned_path
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _sheet_for_document(workbook, document_type: str):
     target = 'COMMERCIAL INVOICE' if document_type == 'Commercial Invoice' else 'PACKING LIST'
     for sheet in workbook.worksheets:
@@ -136,6 +168,14 @@ def _fill_invoice_template(sheet, values: Dict[str, Any]) -> None:
             vertical='center',
             shrink_to_fit=True,
         )
+    for address in ('E26', 'E38'):
+        cell = sheet[address]
+        cell.number_format = '#,##0.00'
+        cell.alignment = Alignment(
+            horizontal='right',
+            vertical='center',
+            shrink_to_fit=True,
+        )
 
 
 def _fill_packing_list_template(sheet, values: Dict[str, Any]) -> None:
@@ -157,6 +197,10 @@ def _fill_packing_list_template(sheet, values: Dict[str, Any]) -> None:
         'F18': gross_mt,
         'G18': gross_kg,
         'H18': values.get('product_specification', ''),
+        'D22': net_mt,
+        'E22': net_kg,
+        'F22': gross_mt,
+        'G22': gross_kg,
         'B24': values.get('product_name_en', ''),
         'B25': values.get('product_specification', ''),
         'B27': values.get('packaging_method', ''),
@@ -168,19 +212,48 @@ def _fill_packing_list_template(sheet, values: Dict[str, Any]) -> None:
     }
     for address, value in cell_values.items():
         _set_template_cell(sheet, address, value)
+    for row in range(18, 22):
+        sheet.row_dimensions[row].height = 15
     sheet.row_dimensions[10].height = max(sheet.row_dimensions[10].height or 0, 24)
     sheet.row_dimensions[11].height = max(sheet.row_dimensions[11].height or 0, 42)
     for row in range(24, 43):
-        cell = sheet.cell(row, 1)
-        if not isinstance(cell.value, str):
-            continue
-        cell.alignment = Alignment(
-            horizontal=cell.alignment.horizontal,
-            vertical='center',
-            wrap_text=True,
-        )
-        if len(cell.value) > 20:
-            sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height or 0, 30)
+        label = sheet.cell(row, 1)
+        value = sheet.cell(row, 2)
+        has_value = value.value not in (None, '')
+        if label.__class__.__name__ != 'MergedCell':
+            label.alignment = Alignment(
+                horizontal=label.alignment.horizontal,
+                vertical='center',
+                wrap_text=has_value,
+            )
+        if value.__class__.__name__ != 'MergedCell':
+            value.alignment = Alignment(
+                horizontal=value.alignment.horizontal,
+                vertical='center',
+                wrap_text=False,
+            )
+        text = str(label.value or '')
+        column_width = sheet.column_dimensions['A'].width or 8.43
+        characters_per_line = max(int(column_width * 0.75), 8)
+        line_count = sum(
+            max(1, (len(line) + characters_per_line - 1) // characters_per_line)
+            for line in text.splitlines()
+        ) if text and has_value else 1
+        sheet.row_dimensions[row].height = max(18, line_count * 17)
+
+
+def _apply_packing_list_table_borders(sheet) -> None:
+    thin = Side(style='thin', color='000000')
+    no_border = Side(style=None)
+    for row in range(16, 23):
+        for column in range(1, 10):
+            cell = sheet.cell(row, column)
+            cell.border = Border(
+                left=no_border,
+                right=thin if column in {1, 2, 3, 4, 5, 6, 7} else no_border,
+                top=thin if row == 16 else no_border,
+                bottom=thin if row in {17, 21, 22} else no_border,
+            )
 
 
 def _export_using_template(
@@ -205,6 +278,7 @@ def _export_using_template(
         _fill_invoice_template(invoice_sheet, values)
     elif document_type == 'Packing List' and packing_sheet is not None:
         _fill_packing_list_template(packing_sheet, values)
+        _apply_packing_list_table_borders(packing_sheet)
 
     target_sheet = invoice_sheet if document_type == 'Commercial Invoice' else packing_sheet
     if document_type in {'Commercial Invoice', 'Packing List'} and target_sheet is None:
@@ -213,14 +287,16 @@ def _export_using_template(
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
     workbook.calculation.calcMode = 'auto'
-    target_sheet.page_setup.orientation = 'landscape'
+    target_sheet.page_setup.orientation = 'portrait'
+    target_sheet.page_setup.paperSize = target_sheet.PAPERSIZE_A4
+    target_sheet.page_setup.scale = None
     target_sheet.page_setup.fitToWidth = 1
     target_sheet.page_setup.fitToHeight = 1
     target_sheet.sheet_properties.pageSetUpPr.fitToPage = True
     _normalize_workbook_fonts(workbook)
-    workbook.save(output_path)
+    saved_path = _save_workbook_safely(workbook, output_path)
     workbook.close()
-    return str(output_path)
+    return str(saved_path)
 
 
 def _section(sheet, row: int, title: str, end_column: int = 5) -> int:

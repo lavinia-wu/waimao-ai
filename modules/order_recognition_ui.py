@@ -8,6 +8,7 @@ import streamlit as st
 
 from database.db import get_connection
 from modules.customers import get_or_create_customer, list_customers
+from modules.lc_deadlines import parse_date
 from modules.lc_parser import (
     attach_lc_to_order,
     get_lc_by_order,
@@ -171,8 +172,25 @@ def render_order_recognition() -> None:
                 destination_port = st.text_input('目的港', value=recognized.get('destination_port', ''))
                 incoterm = st.text_input('贸易条款', value=recognized.get('incoterm', ''))
                 payment_terms = st.text_input('付款方式', value=recognized.get('payment_terms', ''))
-                shipment_date = st.text_input('计划装运日期', value=recognized.get('shipment_date', ''))
-                latest_shipment_date = st.text_input('最迟装运日', value=recognized.get('latest_shipment_date', ''))
+                shipment_date_value = recognized.get('shipment_date', '')
+                latest_shipment_value = recognized.get('latest_shipment_date', '')
+                if shipment_date_value and not parse_date(shipment_date_value):
+                    st.warning(f'AI 识别的计划装运日期格式无法确认：{shipment_date_value}')
+                if latest_shipment_value and not parse_date(latest_shipment_value):
+                    st.warning(f'AI 识别的最迟装运日格式无法确认：{latest_shipment_value}')
+                upload_key = st.session_state.get('recognized_order_upload_digest', 'preview')
+                shipment_date = st.date_input(
+                    '计划装运日期',
+                    value=parse_date(shipment_date_value),
+                    key=f'recognized_shipment_date_{upload_key}',
+                    format='YYYY/MM/DD',
+                )
+                latest_shipment_date = st.date_input(
+                    '最迟装运日',
+                    value=parse_date(latest_shipment_value),
+                    key=f'recognized_latest_shipment_date_{upload_key}',
+                    format='YYYY/MM/DD',
+                )
                 marks_and_numbers = st.text_area('唛头', value=recognized.get('marks_and_numbers', ''))
                 special_requirements = st.text_area('特殊要求', value=recognized.get('special_requirements', ''))
                 lc_choice = st.selectbox('关联已确认信用证', list(lc_labels))
@@ -192,11 +210,8 @@ def render_order_recognition() -> None:
                     ('计划装运日期', shipment_date),
                     ('最迟装运日', latest_shipment_date),
                 ):
-                    if date_value.strip():
-                        try:
-                            date.fromisoformat(date_value.strip()[:10])
-                        except ValueError as exc:
-                            raise ValueError(f'{date_label}必须使用 YYYY-MM-DD 格式。') from exc
+                    if date_value is not None and not isinstance(date_value, date):
+                        raise ValueError(f'{date_label}必须使用有效日期。')
                 customer_id = customer_labels[customer_choice]
                 if customer_id is None:
                     if not customer_name_cn.strip() and not customer_name_en.strip():
@@ -257,8 +272,8 @@ def render_order_recognition() -> None:
                         'destination_port': destination_port,
                         'incoterm': incoterm,
                         'payment_terms': payment_terms,
-                        'shipment_date': shipment_date,
-                        'latest_shipment_date': latest_shipment_date,
+                        'shipment_date': shipment_date.isoformat() if shipment_date else '',
+                        'latest_shipment_date': latest_shipment_date.isoformat() if latest_shipment_date else '',
                         'presentation_deadline': '',
                         'lc_expiry_date': '',
                         'marks_and_numbers': marks_and_numbers,

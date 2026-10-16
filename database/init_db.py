@@ -23,6 +23,12 @@ def create_tables() -> None:
                 'approved_at': 'TEXT',
                 'approved_by': 'INTEGER REFERENCES users(id)',
             },
+            'lc_risks': {
+                'handling_level': "TEXT NOT NULL DEFAULT '需确认'",
+                'handling_status': "TEXT NOT NULL DEFAULT '未处理'",
+                'handling_note': "TEXT NOT NULL DEFAULT ''",
+                'handled_at': 'TEXT',
+            },
         }
         for table, columns in migrations.items():
             existing = {
@@ -31,11 +37,23 @@ def create_tables() -> None:
             for column, definition in columns.items():
                 if column not in existing:
                     conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+        conn.execute(
+            """
+            UPDATE lc_risks
+            SET handling_level = CASE
+                WHEN LOWER(TRIM(risk_level)) IN ('高', 'high', 'critical') THEN '必须处理'
+                WHEN LOWER(TRIM(risk_level)) IN ('低', 'low', 'minor') THEN '一般提示'
+                ELSE '需确认'
+            END
+            WHERE handling_level = '需确认'
+            """
+        )
         conn.execute('CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(user_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(user_id)')
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_lc_owner_approval ON letters_of_credit(user_id, is_approved)'
         )
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_lc_risks_lc ON lc_risks(lc_id)')
         conn.commit()
 
 

@@ -17,6 +17,168 @@ from PIL import Image
 from database.db import get_connection
 from modules.orders import get_order_by_id, update_order
 
+RISK_HANDLING_LEVELS = ('必须处理', '需确认', '一般提示')
+RISK_HANDLING_STATUSES = (
+    '未处理',
+    '已确认可接受',
+    '已整改',
+    '待客户确认',
+    '待修改信用证',
+)
+RESOLVED_RISK_STATUSES = {'已确认可接受', '已整改'}
+
+
+def _risk_handling_level(risk_level: Any, requested: Any = None) -> str:
+    if requested in RISK_HANDLING_LEVELS:
+        return str(requested)
+    level = str(risk_level or '').strip().casefold()
+    if level in {'高', 'high', 'critical'}:
+        return '必须处理'
+    if level in {'低', 'low', 'minor'}:
+        return '一般提示'
+    return '需确认'
+
+
+def _risk_items(value: List[Dict[str, Any]] | str | None) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict) and item.get('original_clause_en')]
+
+
+def _insert_lc_risks(conn, lc_id: int, risks: list[dict[str, Any]]) -> None:
+    for item in risks:
+        risk_level = str(item.get('risk_level') or '中')
+        handling_status = item.get('handling_status')
+        if handling_status not in RISK_HANDLING_STATUSES:
+            handling_status = '未处理'
+        note = str(item.get('handling_note') or '').strip()
+        conn.execute(
+            """
+            INSERT INTO lc_risks (
+                lc_id, risk_level, risk_type, original_clause_en,
+                clause_translation_cn, risk_explanation_cn, suggested_action_cn,
+                handling_level, handling_status, handling_note, handled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lc_id,
+                risk_level,
+                str(item.get('risk_type') or '信用证条款风险'),
+                str(item.get('original_clause_en') or ''),
+                str(item.get('clause_translation_cn') or item.get('translation_cn') or ''),
+                str(item.get('risk_explanation_cn') or ''),
+                str(item.get('suggested_action_cn') or ''),
+                _risk_handling_level(risk_level, item.get('handling_level')),
+                handling_status,
+                note,
+                None,
+            ),
+        )
+        if handling_status != '未处理' or note:
+            conn.execute(
+                'UPDATE lc_risks SET handled_at = CURRENT_TIMESTAMP WHERE id = last_insert_rowid()'
+            )
+
+
+def get_lc_risks(lc_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            'SELECT * FROM lc_risks WHERE lc_id = ? ORDER BY id',
+            (lc_id,),
+        ).fetchall()
+        lc_row = conn.execute(
+            'SELECT parsed_json, risk_report_json FROM letters_of_credit WHERE id = ?',
+            (lc_id,),
+        ).fetchone()
+        if lc_row is None:
+            return []
+        record = dict(lc_row)
+        parsed = _safe_json_object(record.get('parsed_json'))
+        if not rows:
+            legacy_risks = _risk_items(parsed.get('adverse_clauses'))
+            if not legacy_risks:
+                legacy_risks = _risk_items(record.get('risk_report_json'))
+            if legacy_risks:
+                _insert_lc_risks(conn, lc_id, legacy_risks)
+                conn.commit()
+        if not rows:
+            rows = conn.execute(
+                'SELECT * FROM lc_risks WHERE lc_id = ? ORDER BY id',
+                (lc_id,),
+            ).fetchall()
+        source_risks = _risk_items(parsed.get('adverse_clauses'))
+        if not source_risks:
+            source_risks = _risk_items(record.get('risk_report_json'))
+        by_clause = {
+            str(item.get('original_clause_en') or ''): item
+            for item in source_risks
+        }
+        result = []
+        for row in rows:
+            risk = dict(row)
+            source = by_clause.get(str(risk.get('original_clause_en') or ''), {})
+            risk['affected_documents'] = source.get('affected_documents') or []
+            result.append(risk)
+        return result
+
+
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value) if value else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def list_approved_lcs(owner_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, lc_no, applicant, order_id, expiry_date
+            FROM letters_of_credit
+            WHERE user_id = ? AND is_approved = 1
+            ORDER BY approved_at DESC, id DESC
+            """,
+            (owner_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_lc_risk_handling(
+    risk_id: int,
+    status: str,
+    note: str,
+    owner_id: int,
+) -> None:
+    if status not in RISK_HANDLING_STATUSES:
+        raise ValueError('无效的信用证风险处理状态。')
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE lc_risks
+            SET handling_status = ?, handling_note = ?,
+                handled_at = CASE
+                    WHEN ? = '未处理' AND ? = '' THEN NULL
+                    ELSE CURRENT_TIMESTAMP
+                END
+            WHERE id = ? AND EXISTS (
+                SELECT 1 FROM letters_of_credit
+                WHERE letters_of_credit.id = lc_risks.lc_id
+                  AND letters_of_credit.user_id = ?
+                  AND letters_of_credit.is_approved = 1
+            )
+            """,
+            (status, note.strip(), status, note.strip(), risk_id, owner_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError('风险条款不存在或不属于当前业务员的已确认信用证。')
+        conn.commit()
+
 
 def _llm_settings() -> tuple[str, str, str, str]:
     provider = os.getenv('LLM_PROVIDER', 'openai').strip().lower()
@@ -156,8 +318,8 @@ def analyze_lc_clauses(raw_text: str) -> Dict[str, Any]:
                 'Packing List、Sales Contract。其他单据也要列出，但 affected_documents 留空。'
                 '提取交单期限天数、明确写出的装运后邮寄/寄出天数和寄单说明；原文没有明确写的数值必须返回 null。'
                 '必须只返回一个合法 JSON 对象，不要 Markdown。格式：'
-                '{"adverse_clauses":[{"risk_level":"高|中|低","clause":"原文条款","issue":"中文风险说明",'
-                '"recommendation":"中文处理建议","affected_documents":["Commercial Invoice"]}],'
+                '{"adverse_clauses":[{"risk_level":"高|中|低","clause":"原文条款","translation":"中文翻译",'
+                '"issue":"中文风险解释","recommendation":"中文处理建议","affected_documents":["Commercial Invoice"]}],'
                 '"document_requirements":[{"document_type":"Commercial Invoice","original_count":2,'
                 '"copy_count":2,"requirements":"单据内容、签字、认证等要求","affected_documents":["Commercial Invoice"]}],'
                 '"presentation_period_days":21,"dispatch_days_after_shipment":5,"dispatch_instruction":"原文寄单要求"}。'
@@ -190,7 +352,7 @@ def analyze_lc_clauses(raw_text: str) -> Dict[str, Any]:
             'risk_level': level if level in {'高', '中', '低'} else '中',
             'risk_type': str(item.get('issue', '信用证条款风险')),
             'original_clause_en': str(item.get('clause', '')),
-            'clause_translation_cn': str(item.get('issue', '')),
+            'clause_translation_cn': str(item.get('translation') or item.get('issue', '')),
             'risk_explanation_cn': str(item.get('issue', '')),
             'suggested_action_cn': str(item.get('recommendation', '')),
             'affected_documents': _clean_affected_documents(item.get('affected_documents')),
@@ -362,6 +524,11 @@ def save_lc_record(
     approved_by: int | None = None,
 ) -> int:
     documents_required = parsed.get('documents_required') or []
+    risks = _risk_items(
+        risk_report_json
+        if risk_report_json is not None
+        else parsed.get('adverse_clauses')
+    )
     payload = {
         'order_id': order_id,
         'lc_no': parsed.get('lc_no', 'N/A'),
@@ -424,6 +591,7 @@ def save_lc_record(
                 approved_by,
             ),
         )
+        _insert_lc_risks(conn, int(cursor.lastrowid), risks)
         conn.commit()
         return int(cursor.lastrowid)
 

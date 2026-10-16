@@ -121,6 +121,7 @@ def get_order_document_context(order_id: int) -> Dict[str, Any]:
         'shipment_date': order_dict.get('shipment_date', ''),
         'latest_shipment_date': order_dict.get('latest_shipment_date', ''),
         'presentation_deadline': order_dict.get('presentation_deadline', ''),
+        'lc_expiry_date': lc_dict.get('expiry_date') or order_dict.get('lc_expiry_date', ''),
         'lc_no': lc_no,
         'lc_issue_date': lc_issue_date,
         '_lc_document_requirements': lc_requirements if isinstance(lc_requirements, list) else [],
@@ -375,7 +376,14 @@ def generate_all_documents_for_order(
     return results
 
 
-def generate_pdfs_for_order(order_id: int) -> Dict[str, str]:
+def generate_pdfs_for_order(
+    order_id: int,
+    prepared_counts: Dict[str, Dict[str, int]] | None = None,
+) -> Dict[str, str]:
+    from modules.document_validation import assert_pdf_consistency
+
+    assert_pdf_consistency(order_id, prepared_counts)
+
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -414,13 +422,23 @@ def generate_pdfs_for_order(order_id: int) -> Dict[str, str]:
     generated = {}
     for doc_type, (record, source_path) in sources.items():
         pdf_path = source_path.with_suffix('.pdf')
-        if source_path.suffix.lower() == '.docx':
+        try:
+            import pythoncom
             import win32com.client
+        except ImportError as exc:
+            raise RuntimeError(
+                'PDF 导出需要 Windows Microsoft Office 和 pywin32，请确认 Word、Excel 已安装。'
+            ) from exc
 
-            application = win32com.client.DispatchEx('Word.Application')
-            application.Visible = False
-            application.DisplayAlerts = 0
-            try:
+        pythoncom.CoInitialize()
+        application = None
+        document = None
+        workbook = None
+        try:
+            if source_path.suffix.lower() == '.docx':
+                application = win32com.client.DispatchEx('Word.Application')
+                application.Visible = False
+                application.DisplayAlerts = 0
                 document = application.Documents.Open(
                     str(source_path.resolve()),
                     ReadOnly=True,
@@ -428,35 +446,79 @@ def generate_pdfs_for_order(order_id: int) -> Dict[str, str]:
                     AddToRecentFiles=False,
                     NoEncodingDialog=True,
                 )
-                try:
-                    document.ExportAsFixedFormat(str(pdf_path.resolve()), 17)
-                finally:
-                    document.Close(False)
-            finally:
-                application.Quit()
-        else:
-            import win32com.client
-
-            application = win32com.client.DispatchEx('Excel.Application')
-            application.Visible = False
-            application.DisplayAlerts = False
-            application.AskToUpdateLinks = False
-            try:
+                document.PageSetup.PaperSize = 7
+                document.PageSetup.Orientation = 0
+                document.ExportAsFixedFormat(str(pdf_path.resolve()), 17)
+            else:
+                application = win32com.client.DispatchEx('Excel.Application')
+                application.Visible = False
+                application.DisplayAlerts = False
+                application.AskToUpdateLinks = False
                 workbook = application.Workbooks.Open(
                     str(source_path.resolve()),
                     UpdateLinks=0,
-                    ReadOnly=True,
+                    ReadOnly=False,
                     AddToMru=False,
                 )
-                try:
-                    workbook.ExportAsFixedFormat(0, str(pdf_path.resolve()))
-                finally:
+                expected_sheet = (
+                    'COMMERCIAL INVOICE'
+                    if doc_type == 'Commercial Invoice'
+                    else 'PACKING LIST'
+                )
+                worksheet = next(
+                    (
+                        workbook.Worksheets(index)
+                        for index in range(1, workbook.Worksheets.Count + 1)
+                        if expected_sheet in str(workbook.Worksheets(index).Name).upper()
+                    ),
+                    None,
+                )
+                if worksheet is None:
+                    raise ValueError(
+                        f'未找到用于导出的 {doc_type} 工作表，请检查所选 Excel 模板。'
+                    )
+                worksheet.PageSetup.PaperSize = 9
+                worksheet.PageSetup.Orientation = 1
+                worksheet.PageSetup.Zoom = False
+                worksheet.PageSetup.FitToPagesWide = 1
+                worksheet.PageSetup.FitToPagesTall = 1
+                worksheet.PageSetup.PrintArea = worksheet.UsedRange.Address
+                worksheet.ExportAsFixedFormat(0, str(pdf_path.resolve()))
+        except Exception as exc:
+            raise RuntimeError(
+                f'{doc_type} PDF 转换失败（{source_path.name}）：{exc}'
+            ) from exc
+        finally:
+            try:
+                if document is not None:
+                    document.Close(False)
+                if workbook is not None:
                     workbook.Close(False)
             finally:
-                application.Quit()
+                try:
+                    if application is not None:
+                        application.Quit()
+                finally:
+                    pythoncom.CoUninitialize()
 
         if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
             raise RuntimeError(f'{doc_type} PDF 导出失败：未生成有效文件。')
+        try:
+            import fitz
+
+            with fitz.open(pdf_path) as pdf:
+                if len(pdf) != 1:
+                    raise RuntimeError(
+                        f'{doc_type} PDF 共 {len(pdf)} 页，未能排版为单页 A4。'
+                    )
+                page = pdf[0]
+                if abs(page.rect.width - 595.28) > 2 or abs(page.rect.height - 841.89) > 2:
+                    raise RuntimeError(
+                        f'{doc_type} PDF 页面尺寸不是 A4 纵向：'
+                        f'{page.rect.width:.1f} × {page.rect.height:.1f} pt。'
+                    )
+        except ImportError as exc:
+            raise RuntimeError('PDF 页面验证需要 PyMuPDF，请安装项目依赖后重试。') from exc
         generated[doc_type] = str(pdf_path)
 
     with get_connection() as conn:

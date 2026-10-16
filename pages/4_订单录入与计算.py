@@ -17,12 +17,48 @@ from modules.orders import (
     update_order,
 )
 from modules.products import get_product_by_id, list_products
-from modules.lc_parser import attach_lc_to_order, get_lc_by_order, list_approved_unlinked_lcs
+from modules.lc_parser import (
+    attach_lc_to_order,
+    get_lc_by_order,
+    get_lc_risks,
+    list_approved_unlinked_lcs,
+)
 from modules.reminders import generate_and_store_reminders
+from modules.workflow_navigation import (
+    build_workflow_statuses,
+    render_page_next_step,
+    render_workflow_progress,
+)
 
 
 st.set_page_config(layout='wide')
 owner_id = int(require_authenticated_user()['id'])
+all_orders = list_orders(owner_id=owner_id)
+current_order_id = st.session_state.get('order_edit_id') or st.session_state.get(
+    'workflow_current_order_id'
+)
+current_order = next(
+    (order for order in all_orders if order.get('id') == current_order_id),
+    None,
+)
+if current_order is None and all_orders:
+    current_order = all_orders[0]
+    current_order_id = current_order['id']
+    st.session_state['workflow_current_order_id'] = current_order_id
+current_lc = (
+    get_lc_by_order(current_order_id, owner_id)
+    if current_order_id is not None else None
+)
+current_risks = get_lc_risks(current_lc['id']) if current_lc else []
+high_risk_open = any(
+    str(risk.get('risk_level') or '').strip().casefold() in {'高', 'high', 'critical'}
+    and risk.get('handling_status') not in {'已确认可接受', '已整改'}
+    for risk in current_risks
+)
+consistency_summary = (
+    st.session_state.get(f'workflow_consistency_{current_order_id}')
+    if current_order_id is not None else None
+)
 
 
 def default_order_form(defaults: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -54,6 +90,19 @@ if 'order_edit_id' not in st.session_state:
 
 st.title('订单管理')
 st.caption('新订单可选择识别资料或手动录入；确认保存后统一进入下方订单列表。')
+render_workflow_progress(
+    build_workflow_statuses(
+        current_order,
+        current_lc,
+        high_risk_open=high_risk_open,
+        consistency=consistency_summary,
+        lc_preview=bool(st.session_state.get('lc_analysis_preview')),
+    ),
+    '当前订单关联的信用证存在未处理高风险条款；可继续前往单证页查看，PDF生成仍沿用现有门禁。'
+    if high_risk_open else None,
+)
+render_page_next_step('下一步：前往单证生成', 'pages/5_单证生成与导出.py')
+st.divider()
 
 customers = list_customers(owner_id=owner_id)
 products = list_products()
@@ -157,11 +206,13 @@ with entry_tabs[0]:
                 form_defaults['customer_id'] = customer_id
                 form_defaults['user_id'] = owner_id
                 order_id = create_order(form_defaults)
+                st.session_state['workflow_current_order_id'] = order_id
                 st.success('订单保存成功')
             else:
                 form_defaults['user_id'] = owner_id
                 update_order(st.session_state.order_edit_id, form_defaults)
                 order_id = st.session_state.order_edit_id
+                st.session_state['workflow_current_order_id'] = order_id
                 st.success('订单更新成功')
             lc_record = get_lc_by_order(order_id, owner_id)
             lc_data = json.loads(lc_record.get('parsed_json') or '{}') if lc_record else {}
@@ -208,6 +259,7 @@ for order in orders:
     with c2:
         if st.button('编辑', key=f'order_edit_{order["id"]}', use_container_width=True):
             st.session_state.order_edit_id = order['id']
+            st.session_state['workflow_current_order_id'] = order['id']
             st.rerun()
     with c3:
         if st.button('复制', key=f'order_copy_{order["id"]}', use_container_width=True):
@@ -217,6 +269,8 @@ for order in orders:
     with c4:
         if st.button('删除', key=f'order_delete_{order["id"]}', use_container_width=True):
             delete_order(order['id'], owner_id)
+            if st.session_state.get('workflow_current_order_id') == order['id']:
+                st.session_state.pop('workflow_current_order_id', None)
             st.success('已删除订单')
             st.rerun()
     st.divider()
@@ -239,6 +293,8 @@ if unlinked_lcs and orders:
             lc_id = lc_options[lc_choice]
             target_order_id = order_options[order_choice]
             attach_lc_to_order(lc_id, target_order_id, owner_id)
+            st.session_state['workflow_current_order_id'] = target_order_id
+            st.session_state['workflow_current_lc_id'] = lc_id
             lc_record = get_lc_by_order(target_order_id, owner_id)
             if lc_record:
                 import json
