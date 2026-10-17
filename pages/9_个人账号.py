@@ -5,7 +5,6 @@ import streamlit as st
 from modules.auth import change_password, require_authenticated_user
 
 
-st.set_page_config(layout='wide')
 user = require_authenticated_user()
 
 st.title('我的账号')

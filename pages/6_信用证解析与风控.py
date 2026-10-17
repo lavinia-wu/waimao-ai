@@ -117,7 +117,6 @@ def render_risk_details(item, index):
     st.markdown(f"**受影响单据：** {', '.join(affected) if affected else '待确认'}")
 
 
-st.set_page_config(layout='wide')
 owner_id = int(require_authenticated_user()['id'])
 
 st.title('信用证解析、条款分析与翻译')

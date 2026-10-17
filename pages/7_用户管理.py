@@ -13,7 +13,6 @@ from modules.auth import (
 from modules.customers import list_customers
 
 
-st.set_page_config(layout='wide')
 current_user = require_authenticated_user()
 if current_user['role'] != 'admin':
     st.error('仅管理员可以管理业务员账号。')

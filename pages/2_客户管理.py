@@ -18,7 +18,6 @@ from modules.customers import (
 )
 
 
-st.set_page_config(layout='wide')
 current_user = require_authenticated_user()
 owner_id = int(current_user['id'])
 

@@ -4,6 +4,8 @@ from collections.abc import Mapping
 
 import streamlit as st
 
+from modules.ui_style import THEME_PRIMARY
+
 
 STAGES = (
     '信用证确认',
@@ -110,7 +112,7 @@ def render_page_next_step(label: str, target: str) -> None:
 def render_section_next_step(label: str, anchor: str) -> None:
     st.markdown(
         f'<a href="#{anchor}" style="display:inline-block;padding:0.5rem 1rem;'
-        'border-radius:0.5rem;background-color:#ff4b4b;color:white;'
+        f'border-radius:0.5rem;background-color:{THEME_PRIMARY};color:white;'
         'text-decoration:none;font-weight:600;">'
         f'{label}</a>',
         unsafe_allow_html=True,

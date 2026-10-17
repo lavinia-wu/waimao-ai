@@ -17,7 +17,6 @@ from modules.products import (
 )
 
 
-st.set_page_config(layout='wide')
 require_authenticated_user()
 
 

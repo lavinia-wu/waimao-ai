@@ -31,7 +31,6 @@ from modules.workflow_navigation import (
 )
 
 
-st.set_page_config(layout='wide')
 owner_id = int(require_authenticated_user()['id'])
 all_orders = list_orders(owner_id=owner_id)
 current_order_id = st.session_state.get('order_edit_id') or st.session_state.get(

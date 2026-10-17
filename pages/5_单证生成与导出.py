@@ -36,7 +36,6 @@ from modules.workflow_navigation import (
 )
 
 
-st.set_page_config(layout='wide')
 owner_id = int(require_authenticated_user()['id'])
 
 

@@ -8,8 +8,6 @@ from database.db import get_connection
 from modules.auth import require_authenticated_user
 from modules.reminders import list_reminders, mark_reminder_done
 
-
-st.set_page_config(layout='wide')
 user = require_authenticated_user()
 owner_id = int(user['id'])
 today = date.today()
