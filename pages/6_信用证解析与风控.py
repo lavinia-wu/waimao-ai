@@ -33,6 +33,7 @@ from modules.lc_parser import (
 from modules.orders import get_order_by_id
 from modules.workflow_navigation import (
     build_workflow_statuses,
+    invalidate_workflow_consistency,
     render_page_next_step,
     render_workflow_progress,
 )
@@ -638,6 +639,9 @@ if preview:
                         approved_by=owner_id,
                     )
                     st.session_state['workflow_current_lc_id'] = lc_id
+                    invalidate_workflow_consistency(
+                        st.session_state.get('workflow_current_order_id')
+                    )
                     for key in list(st.session_state.keys()):
                         if str(key).startswith(f'lc_confirm_{form_digest}_') or str(key).startswith(
                             f'preview_risk_'

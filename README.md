@@ -10,20 +10,39 @@ foreign_trade_doc_system/
 ├── requirements.txt
 ├── README.md
 ├── .env.example
+├── .gitignore
 ├── config/
 │   ├── __init__.py
-│   └── settings.py
+│   └── settings.py          # DB_PATH / 目录 / API 等配置
 ├── database/
 │   ├── __init__.py
-│   ├── db.py
-│   ├── models.py
-│   ├── init_db.py
+│   ├── db.py                # 连接封装（每次读取 settings.db_path）
+│   ├── models.py            # 建表 SQL
+│   ├── init_db.py           # 建表 + 轻量迁移 + 示例数据
 │   └── foreign_trade.db
-├── modules/
+├── modules/                 # 业务逻辑层
 │   ├── __init__.py
-│   ├── auth.py
-│   ├── customers.py
-│   └── order_recognition_ui.py
+│   ├── auth.py              # 登录、用户/角色、客户归属转移
+│   ├── consistency_check.py # 旧版一致性校验（已无调用方，见“遗留模块”）
+│   ├── customers.py         # 客户档案、批量导入
+│   ├── document_validation.py # 单单一致性校验 + PDF 门禁
+│   ├── documents.py         # 单证生成、Word/Excel/PDF 输出
+│   ├── lc_confirmation.py   # 信用证六组确认表单、变更摘要、合并
+│   ├── lc_deadlines.py      # 关键日期解析与期限卡片
+│   ├── lc_parser.py         # 信用证解析、条款分析、风险持久化
+│   ├── lc_risk.py           # 旧版风险分析（已无调用方，见“遗留模块”）
+│   ├── order_recognition.py # 订单资料 AI 识别
+│   ├── order_recognition_ui.py # 订单识别页面组件
+│   ├── orders.py            # 订单增删改查、金额计算
+│   ├── products.py          # 产品库
+│   ├── reminders.py         # 交单/寄单提醒
+│   └── workflow_navigation.py # 订单流程阶段状态与导航
+├── services/                # 文档渲染与外部依赖封装
+│   ├── __init__.py
+│   ├── amount_words.py      # 金额大写
+│   ├── excel_service.py     # Excel 模板填充
+│   ├── pdf_export_service.py # A4 单页 PDF 排版
+│   └── word_service.py      # Word 模板占位符替换
 ├── pages/
 │   ├── 1_首页.py
 │   ├── 2_客户管理.py
@@ -33,12 +52,21 @@ foreign_trade_doc_system/
 │   ├── 6_信用证解析与风控.py
 │   ├── 7_用户管理.py
 │   └── 9_个人账号.py
-├── templates/
-├── uploads/
-├── outputs/
-├── tests/
-└── .streamlit/
+├── templates/               # 客户上传的 Word/Excel 模板
+├── system_templates/        # 系统内置模板，不混入客户模板列表
+├── uploads/                 # 上传的信用证/订单资料
+├── outputs/                 # 生成的单证，按订单分子目录
+└── tests/
+    ├── test_document_validation.py
+    ├── test_lc_confirmation_form.py
+    ├── test_lc_risk_handling.py
+    ├── test_orders_date_fields.py
+    └── test_workflow_navigation.py
 ```
+
+> 说明：仓库中没有 `.streamlit/` 配置文件目录。Streamlit 主题与服务端配置（如需要）请自行新建
+> `.streamlit/config.toml`；日常本地开发直接 `streamlit run app.py` 即可，无需额外配置。
+> 数据库与临时目录通过环境变量配置（见“环境变量”），不要提交 `database/foreign_trade.db`。
 
 ## 2. 数据库设计
 
@@ -141,3 +169,23 @@ cp .env.example .env
 `.xlsx` 模板会按工作表名称识别 Commercial Invoice 和 Packing List；CI 与 PL 可以使用各自独立的 Excel 文件，也支持包含相应工作表的工作簿。系统在保留所选工作簿版式、原有条款和未映射字段的基础上填入订单信息。船名、品牌、柜号/封号和批次等订单资料中尚未建模的内容会保留模板原值，出单前需要人工核对。Excel 输出字体统一为 Arial。Word 模板中的 `{{company_name}}`、`{{customer_name_en}}`、`{{document_no}}`、`{{quantity}}`、`{{total_amount}}` 等占位符会自动替换为订单数据，生成的 Word 字体统一为 Arial（中文使用 Microsoft YaHei）。
 
 输出文件统一保存在 `outputs/` 下，并按每个订单建立“订单序号 + 客户名 + 产品名”的独立子文件夹。文件名采用“订单序号 + 客户名 + 产品名 + 单证类型”格式，例如 `outputs/001客户产品/001客户产品_Commercial_Invoice.xlsx`；序号按系统订单 ID 补齐至少三位。
+
+## 9. 自动化测试
+
+安装依赖后在项目根目录执行：
+
+```bash
+python -m pytest
+```
+
+- 与数据库相关的测试（`test_lc_risk_handling.py`、`test_orders_date_fields.py`）会在临时目录中新建独立
+  SQLite 库，并通过 `patch.object(settings, 'db_path', ...)` 隔离，**不会读写或迁移真实的
+  `database/foreign_trade.db`**。
+- 其余测试为纯逻辑单元测试，不依赖网络与 AI 服务。
+
+## 10. 遗留模块
+
+以下模块目前没有任何调用方，属于重构前的旧实现，暂保留待确认后删除：
+
+- `modules/consistency_check.py`：旧版单单一致性校验，已被 `modules/document_validation.py` 取代。
+- `modules/lc_risk.py`：旧版信用证风险分析，已被 `modules/lc_parser.py` 的 `analyze_lc_clauses()` 取代。

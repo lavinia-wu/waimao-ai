@@ -30,6 +30,7 @@ from modules.orders import list_orders
 from services.word_service import ensure_default_template
 from modules.workflow_navigation import (
     build_workflow_statuses,
+    invalidate_workflow_consistency,
     render_section_next_step,
     render_workflow_progress,
 )
@@ -143,6 +144,8 @@ st.info(f"当前订单状态：{workflow_labels.get((selected_order or {}).get('
 lc_record = get_lc_by_order(selected_order_id, owner_id)
 if lc_record:
     st.session_state['workflow_current_lc_id'] = lc_record['id']
+else:
+    st.session_state.pop('workflow_current_lc_id', None)
 current_risks = get_lc_risks(lc_record['id']) if lc_record else []
 high_risk_open = any(
     str(risk.get('risk_level') or '').strip().casefold() in {'高', 'high', 'critical'}
@@ -338,6 +341,7 @@ if st.button('生成当前单证', use_container_width=True):
             custom_template_path=template_path,
         )
         st.success(f'已生成：{doc_type}')
+        invalidate_workflow_consistency(selected_order_id)
         st.json(results)
         for key, label in [('word', 'Word'), ('excel', 'Excel')]:
             file_path = results.get(key)
@@ -354,6 +358,7 @@ if st.button('批量生成四单', use_container_width=True):
             template_paths=batch_template_paths,
         )
         st.success('四单已全部生成')
+        invalidate_workflow_consistency(selected_order_id)
         for doc_type_name, paths in results.items():
             st.markdown(f'### {doc_type_name}')
             for key, label in [('word', 'Word'), ('excel', 'Excel')]:
