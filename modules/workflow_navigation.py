@@ -92,6 +92,16 @@ def build_workflow_statuses(
     return statuses
 
 
+def consistency_state_key(order_id: int | None) -> str:
+    return f'workflow_consistency_{order_id}'
+
+
+def invalidate_workflow_consistency(order_id: int | None) -> None:
+    if order_id is None:
+        return
+    st.session_state.pop(consistency_state_key(order_id), None)
+
+
 def render_page_next_step(label: str, target: str) -> None:
     if st.button(label, type='primary', use_container_width=True):
         st.switch_page(target)

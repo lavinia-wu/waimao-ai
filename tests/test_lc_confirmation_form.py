@@ -87,6 +87,50 @@ class LcConfirmationFormTests(unittest.TestCase):
         )
         self.assertEqual(result['documents_required'][0]['original_count'], 3)
 
+    def test_merge_accepts_chinese_editor_columns_and_new_rows(self) -> None:
+        ai = {
+            **self.valid_values(),
+            'documents_required': [{
+                'document_type': 'Commercial Invoice',
+                'original_count': 2,
+                'copy_count': 1,
+                'special_requirements': 'Signed',
+                'affected_documents': ['Commercial Invoice'],
+                'source_clause': 'keep-me',
+            }],
+        }
+        result = merge_confirmed_values(
+            ai,
+            self.valid_values(),
+            [
+                {
+                    '_source_index': 0.0,
+                    '单据类型': 'Commercial Invoice',
+                    '正本份数': 3,
+                    '副本份数': 1,
+                    '特殊要求': 'Signed and stamped',
+                },
+                {
+                    '_source_index': float('nan'),
+                    '单据类型': 'Packing List',
+                    '正本份数': 1,
+                    '副本份数': 0,
+                    '特殊要求': '',
+                },
+            ],
+        )
+        self.assertEqual(len(result['documents_required']), 2)
+        self.assertEqual(result['documents_required'][0]['original_count'], 3)
+        self.assertEqual(result['documents_required'][0]['affected_documents'], ['Commercial Invoice'])
+        self.assertEqual(result['documents_required'][0]['source_clause'], 'keep-me')
+        self.assertEqual(result['documents_required'][1]['document_type'], 'Packing List')
+        self.assertEqual(result['documents_required'][1]['original_count'], 1)
+        errors = validate_confirmation(
+            self.valid_values(),
+            [{'单据类型': 'Bill of Lading', '正本份数': -2, '副本份数': 1}],
+        )
+        self.assertTrue(any('正本份数不能为负数' in error for error in errors))
+
     def test_source_excerpt_reports_unlocated_text_instead_of_guessing(self) -> None:
         original, translation = source_excerpts(
             'MT700 has no field label here.',

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 import math
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_date_text(value: Any) -> str:
+    if value is None or value == '':
+        return ''
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if text.casefold() in {'none', 'nat', 'nan'}:
+        return ''
+    return text
 
 
 def validate_order_payload(payload: Dict[str, Any]) -> None:
@@ -80,10 +94,10 @@ def create_order(payload: Dict[str, Any]) -> int:
         destination_port = str(payload.get('destination_port', '')).strip()
         incoterm = str(payload.get('incoterm', '')).strip()
         payment_terms = str(payload.get('payment_terms', '')).strip()
-        shipment_date = str(payload.get('shipment_date', '')).strip()
-        latest_shipment_date = str(payload.get('latest_shipment_date', '')).strip()
-        presentation_deadline = str(payload.get('presentation_deadline', '')).strip()
-        lc_expiry_date = str(payload.get('lc_expiry_date', '')).strip()
+        shipment_date = _as_date_text(payload.get('shipment_date', ''))
+        latest_shipment_date = _as_date_text(payload.get('latest_shipment_date', ''))
+        presentation_deadline = _as_date_text(payload.get('presentation_deadline', ''))
+        lc_expiry_date = _as_date_text(payload.get('lc_expiry_date', ''))
         marks_and_numbers = str(payload.get('marks_and_numbers', '')).strip()
         special_requirements = str(payload.get('special_requirements', '')).strip()
 

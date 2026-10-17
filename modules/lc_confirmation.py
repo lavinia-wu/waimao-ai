@@ -48,6 +48,12 @@ FIELD_GROUPS = [
 ]
 
 REQUIRED_FIELDS = ('lc_no', 'applicant', 'beneficiary', 'lc_amount', 'currency', 'goods_description')
+DOCUMENT_ROW_FIELDS = {
+    'document_type': ('document_type', '单据类型'),
+    'original_count': ('original_count', '正本份数'),
+    'copy_count': ('copy_count', '副本份数'),
+    'special_requirements': ('special_requirements', '特殊要求', 'requirements'),
+}
 
 
 def _numeric(value: Any) -> Decimal | None:
@@ -100,6 +106,43 @@ def normalize_field_value(field: str, kind: str, value: Any) -> Any:
     return '' if _is_blank(value) else str(value).strip()
 
 
+def _row_value(row: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in row and not _is_blank(row.get(name)):
+            return row.get(name)
+    for name in names:
+        if name in row:
+            return row.get(name)
+    return None
+
+
+def normalize_document_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    source_index = row.get('_source_index')
+    if _is_blank(source_index):
+        source_index = None
+    else:
+        try:
+            source_index = int(source_index)
+        except (TypeError, ValueError):
+            source_index = None
+    document_type = _row_value(row, DOCUMENT_ROW_FIELDS['document_type'])
+    special_requirements = _row_value(row, DOCUMENT_ROW_FIELDS['special_requirements'])
+    return {
+        '_source_index': source_index,
+        'document_type': '' if _is_blank(document_type) else str(document_type).strip(),
+        'original_count': _row_value(row, DOCUMENT_ROW_FIELDS['original_count']),
+        'copy_count': _row_value(row, DOCUMENT_ROW_FIELDS['copy_count']),
+        'special_requirements': (
+            '' if _is_blank(special_requirements) else str(special_requirements).strip()
+        ),
+    }
+
+
+def normalize_document_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [normalize_document_row(row) for row in rows or []]
+
+
 def validate_confirmation(
     values: dict[str, Any],
     document_rows: list[dict[str, Any]],
@@ -124,7 +167,7 @@ def validate_confirmation(
             errors.append(f'{label}必须是有效数值。')
         elif kind == 'number' and _numeric(value) < 0:
             errors.append(f'{label}不能为负数。')
-    for index, row in enumerate(document_rows, start=1):
+    for index, row in enumerate(normalize_document_rows(document_rows), start=1):
         if _is_blank(row.get('document_type')):
             errors.append(f'单据要求第 {index} 行必须填写单据类型。')
         for field, label in (
@@ -181,13 +224,13 @@ def merge_confirmed_values(
 
     original_requirements = ai_values.get('documents_required') or []
     requirements = []
-    for row in document_rows:
-        document_type = '' if _is_blank(row.get('document_type')) else str(row.get('document_type')).strip()
+    for row in normalize_document_rows(document_rows):
+        document_type = row.get('document_type') or ''
         if not document_type:
             continue
         source_index = row.get('_source_index')
         original = {}
-        if source_index is not None and not _is_blank(source_index):
+        if source_index is not None:
             try:
                 original = original_requirements[int(source_index)]
             except (ValueError, TypeError, IndexError):
@@ -197,10 +240,7 @@ def merge_confirmed_values(
             'document_type': document_type,
             'original_count': _optional_nonnegative_int(row.get('original_count')),
             'copy_count': _optional_nonnegative_int(row.get('copy_count')),
-            'special_requirements': (
-                '' if _is_blank(row.get('special_requirements'))
-                else str(row.get('special_requirements')).strip()
-            ),
+            'special_requirements': row.get('special_requirements') or '',
         })
         requirements.append(requirement)
     merged['documents_required'] = requirements
@@ -219,7 +259,9 @@ def _optional_nonnegative_int(value: Any) -> int | None:
 def _is_blank(value: Any) -> bool:
     if value is None or (isinstance(value, str) and not value.strip()):
         return True
-    return isinstance(value, float) and math.isnan(value)
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    return type(value).__name__ in {'NAType', 'NaTType'}
 
 
 def _excerpt(text: str, aliases: tuple[str, ...], value: Any) -> str:
