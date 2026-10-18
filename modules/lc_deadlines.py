@@ -111,9 +111,8 @@ def render_lc_deadline_cards(
     for column, card in zip(columns, cards):
         with column:
             deadline = card['value']
-            st.markdown(f'#### {card["label"]}')
             if deadline is None:
-                st.error('待核对')
+                st.metric(card['label'], '待核对')
                 st.caption(card['source'])
                 continue
 

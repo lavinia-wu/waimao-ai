@@ -24,7 +24,6 @@ def render_order_recognition() -> None:
     user = st.session_state['auth_user']
     owner_id = int(user['id'])
 
-    st.subheader('上传并识别订单资料')
     st.caption('识别结果经业务员核对确认后，会自动保存到下方订单管理列表；缺失信息可在手动录入中补充。')
     st.warning('识别内容可能有误。订单资料会发送到 .env 配置的 AI 服务；请确认信息合规并逐项核对后再提交。')
     if st.session_state.get('last_created_order_no'):
@@ -57,7 +56,7 @@ def render_order_recognition() -> None:
 
     recognized = st.session_state.get('recognized_order')
     if recognized:
-        st.subheader('复核识别结果')
+        st.markdown('**复核识别结果**')
         customers = list_customers(owner_id=owner_id)
         products = list_products()
         customer_labels = {'新增客户': None}

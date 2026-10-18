@@ -10,7 +10,19 @@ def create_tables() -> None:
     with get_connection() as conn:
         conn.executescript('\n'.join(CREATE_TABLES))
         migrations = {
-            'customers': {'user_id': 'INTEGER REFERENCES users(id)'},
+            'customers': {
+                'user_id': 'INTEGER REFERENCES users(id)',
+                'country_code': 'TEXT',
+            },
+            'products': {
+                'sku': 'TEXT',
+                'stock_qty': 'REAL',
+                'unit': 'TEXT',
+                'safety_stock': 'REAL',
+                'warehouse': 'TEXT',
+                'stock_updated_at': 'TEXT',
+                'stock_updated_by': 'INTEGER REFERENCES users(id)',
+            },
             'orders': {
                 'user_id': 'INTEGER REFERENCES users(id)',
                 'workflow_status': "TEXT DEFAULT 'order_confirmed'",

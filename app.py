@@ -5,10 +5,16 @@ import streamlit as st
 from config.settings import settings
 from database.init_db import init_db
 from modules.auth import authenticate, create_user, get_active_user, user_count
+from modules.ui_style import inject_base_css, page_header, render_status_badge
+
+ROLE_LABELS = {
+    'admin': '管理员',
+    'sales': '业务员',
+}
 
 
 def render_authentication() -> bool:
-    st.title('外贸业务工作台')
+    page_header('外贸业务工作台', caption='请先登录或使用管理员账号初始化系统')
     if user_count() == 0:
         st.info('首次使用，请创建系统管理员账号。已有客户和订单将归属该管理员。')
         with st.form('initial_admin_form'):
@@ -63,15 +69,23 @@ def configure_app() -> None:
 def main() -> None:
     configure_app()
     init_db()
+    inject_base_css()
 
     if not render_authentication():
         return
     current_user = st.session_state['auth_user']
-    st.sidebar.title('外贸单证系统')
-    st.sidebar.caption(f"当前业务员：{current_user['display_name']}")
-    if st.sidebar.button('退出登录', use_container_width=True):
-        st.session_state.pop('auth_user', None)
-        st.rerun()
+    with st.sidebar:
+        st.markdown('**外贸AI单证与信用证风控系统**')
+        st.caption('外贸业务工作台')
+        st.divider()
+        st.markdown(f"**{current_user['display_name']}** · {current_user['username']}")
+        render_status_badge(
+            ROLE_LABELS.get(str(current_user['role']), str(current_user['role'])),
+            'info',
+        )
+        if st.button('退出登录', use_container_width=True):
+            st.session_state.pop('auth_user', None)
+            st.rerun()
 
     pages = [
         st.Page('pages/1_首页.py', title='业务看板', icon='🏠'),

@@ -4,7 +4,7 @@ from collections.abc import Mapping
 
 import streamlit as st
 
-from modules.ui_style import THEME_PRIMARY
+from modules.ui_style import subsection
 
 
 STAGES = (
@@ -29,7 +29,7 @@ def render_workflow_progress(
     warning: str | None = None,
 ) -> None:
     """Render a compact, read-only view of the order workflow."""
-    st.markdown('#### 当前订单进度')
+    subsection('当前订单进度')
     columns = st.columns(len(STAGES))
     for column, stage in zip(columns, STAGES):
         status = statuses.get(stage, '未开始')
@@ -107,13 +107,3 @@ def invalidate_workflow_consistency(order_id: int | None) -> None:
 def render_page_next_step(label: str, target: str) -> None:
     if st.button(label, type='primary', use_container_width=True):
         st.switch_page(target)
-
-
-def render_section_next_step(label: str, anchor: str) -> None:
-    st.markdown(
-        f'<a href="#{anchor}" style="display:inline-block;padding:0.5rem 1rem;'
-        f'border-radius:0.5rem;background-color:{THEME_PRIMARY};color:white;'
-        'text-decoration:none;font-weight:600;">'
-        f'{label}</a>',
-        unsafe_allow_html=True,
-    )

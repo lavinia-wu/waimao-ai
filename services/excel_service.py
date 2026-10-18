@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import copy
 from datetime import datetime
+from io import BytesIO
 import os
 from pathlib import Path
 import tempfile
@@ -457,3 +458,104 @@ def export_document_excel(
 
     workbook.save(target)
     return str(target)
+
+
+# 列表导出：客户、产品等成批数据的通用写出逻辑
+FORMULA_PREFIXES = ('=', '+', '-', '@')
+
+
+def sanitize_cell_value(value: Any) -> Any:
+    """防止 Excel 公式注入：以 = + - @ 开头的文本前置英文单引号。"""
+    if isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+def dated_export_filename(prefix: str, moment: datetime | None = None) -> str:
+    """导出文件名包含类型与导出日期，例如 客户_20261017.xlsx。"""
+    when = moment or datetime.now()
+    return f'{prefix}_{when.strftime("%Y%m%d")}.xlsx'
+
+
+def _display_width(text: str) -> int:
+    """中文按两个字符宽度估算列宽。"""
+    return sum(2 if ord(character) > 127 else 1 for character in text)
+
+
+def build_table_workbook(
+    sheet_title: str,
+    headers: list[str],
+    rows: list[list[Any]],
+    text_columns: set[int] | None = None,
+    number_columns: set[int] | None = None,
+) -> Workbook:
+    """生成列表型工作簿：中文表头、文本列按文本保存、数值列带千分位。
+
+    列序号从 1 开始，与 Excel 列号一致。
+    """
+    text_columns = text_columns or set()
+    number_columns = number_columns or set()
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = sheet_title[:31]
+    sheet.sheet_view.showGridLines = False
+
+    for column, header in enumerate(headers, start=1):
+        cell = sheet.cell(1, column, str(header))
+        cell.fill = PatternFill('solid', fgColor=NAVY)
+        cell.font = Font(name='Arial', size=10, bold=True, color=WHITE)
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    sheet.row_dimensions[1].height = 24
+
+    for row_index, row in enumerate(rows, start=2):
+        for column, raw_value in enumerate(row, start=1):
+            value = raw_value if raw_value is not None else ''
+            if column in text_columns and value != '':
+                value = str(value)
+            cell = sheet.cell(row_index, column, sanitize_cell_value(value))
+            cell.font = Font(name='Arial', size=9, color='243447')
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+            if column in text_columns:
+                cell.number_format = '@'
+            elif column in number_columns and isinstance(value, (int, float)):
+                cell.number_format = '#,##0.00' if isinstance(value, float) else '#,##0'
+                cell.alignment = Alignment(horizontal='right', vertical='top')
+
+    last_row = max(len(rows) + 1, 1)
+    _apply_table_borders(sheet, 1, last_row, 1, len(headers))
+    for column, header in enumerate(headers, start=1):
+        sample = rows[0][column - 1] if rows else ''
+        width = max(_display_width(str(header)), _display_width(str(sample or '')))
+        sheet.column_dimensions[get_column_letter(column)].width = min(max(width + 4, 10), 46)
+    sheet.freeze_panes = 'A2'
+    if rows:
+        sheet.auto_filter.ref = f'A1:{get_column_letter(len(headers))}{last_row}'
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.page_setup.fitToWidth = 1
+    sheet.page_setup.fitToHeight = 0
+    sheet.page_margins = PageMargins(left=0.25, right=0.25, top=0.5, bottom=0.5, header=0.2, footer=0.2)
+    sheet.print_title_rows = '1:1'
+    return workbook
+
+
+def workbook_bytes(workbook: Workbook) -> bytes:
+    """把工作簿输出为内存字节，供下载使用，不在磁盘留文件。"""
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def build_table_export_file(
+    prefix: str,
+    sheet_title: str,
+    headers: list[str],
+    rows: list[list[Any]],
+    text_columns: set[int] | None = None,
+    number_columns: set[int] | None = None,
+) -> tuple[str, bytes]:
+    """一步生成可直接下载的（文件名, 字节流）。"""
+    workbook = build_table_workbook(
+        sheet_title, headers, rows, text_columns, number_columns
+    )
+    return dated_export_filename(prefix), workbook_bytes(workbook)

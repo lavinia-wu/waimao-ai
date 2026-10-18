@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from database.db import get_connection
+from services.excel_service import build_table_export_file
 
 
 CUSTOMER_FIELDS = [
@@ -197,19 +198,71 @@ def delete_customer(customer_id: int, owner_id: int | None = None) -> None:
         conn.commit()
 
 
-def export_customers_excel(file_path: str, search_text: str = '', owner_id: int | None = None) -> str:
-    import pandas as pd
+CUSTOMER_EXPORT_HEADERS = [
+    '客户中文名', '客户英文名', '国家/地区', '公司地址', '联系人', '邮箱', '电话',
+    '目的港', '付款方式', '贸易条款', '备注', '更新时间',
+]
+# 电话按文本保存：避免前导零丢失或长号码变成科学计数法
+CUSTOMER_EXPORT_TEXT_COLUMNS = {7}
 
-    data = list_customers(search_text, owner_id)
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df = df[[
-            'id', 'customer_name_cn', 'customer_name_en', 'company_address', 'contact_person',
-            'email', 'phone', 'destination_port', 'payment_terms', 'incoterm', 'remark',
-            'created_at', 'updated_at'
-        ]]
-    df.to_excel(file_path, index=False)
-    return file_path
+
+def customer_export_rows(
+    search_text: str = '',
+    owner_id: int | None = None,
+) -> List[List[Any]]:
+    """导出用取数：只取列表字段，不含认证信息与服务器路径。"""
+    customers = list_customers(search_text, owner_id)
+    owner_names: Dict[int, str] = {}
+    if customers:
+        with get_connection() as conn:
+            owner_names = {
+                int(row['id']): row['display_name']
+                for row in conn.execute('SELECT id, display_name FROM users').fetchall()
+            }
+    rows: List[List[Any]] = []
+    for customer in customers:
+        user_id = customer.get('user_id')
+        rows.append([
+            customer.get('customer_name_cn') or '',
+            customer.get('customer_name_en') or '',
+            customer.get('country_code') or '',
+            customer.get('company_address') or '',
+            customer.get('contact_person') or '',
+            customer.get('email') or '',
+            customer.get('phone') or '',
+            customer.get('destination_port') or '',
+            customer.get('payment_terms') or '',
+            customer.get('incoterm') or '',
+            customer.get('remark') or '',
+            customer.get('updated_at') or '',
+            owner_names.get(int(user_id), '未分配') if user_id else '未分配',
+        ])
+    return rows
+
+
+def export_customers_excel(
+    search_text: str = '',
+    owner_id: int | None = None,
+) -> tuple[str, bytes]:
+    """导出客户资料为（文件名, 字节流）。
+
+    owner_id 为 None 时表示管理员导出全部有权限数据，并包含归属业务员列；
+    传入业务员 ID 时只导出该业务员的客户，不显示归属列。
+    """
+    include_owner = owner_id is None
+    headers = list(CUSTOMER_EXPORT_HEADERS)
+    rows = customer_export_rows(search_text, owner_id)
+    if include_owner:
+        headers.append('归属业务员')
+    else:
+        rows = [row[:-1] for row in rows]
+    return build_table_export_file(
+        '客户',
+        '客户',
+        headers,
+        rows,
+        text_columns=CUSTOMER_EXPORT_TEXT_COLUMNS,
+    )
 
 
 def import_customers_excel(content: bytes, owner_id: int | None) -> Dict[str, Any]:

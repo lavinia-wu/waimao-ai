@@ -8,6 +8,7 @@ import streamlit as st
 from PIL import UnidentifiedImageError
 
 from modules.auth import require_authenticated_user
+from modules.customers import get_customer_by_id
 from modules.lc_deadlines import parse_date, render_lc_deadline_cards
 from modules.lc_confirmation import (
     FIELD_GROUPS,
@@ -18,21 +19,36 @@ from modules.lc_confirmation import (
     validate_confirmation,
 )
 from modules.lc_parser import (
+    RISK_HANDLING_STATUSES,
     analyze_lc_clauses,
     build_lc_summary,
     extract_lc_text,
-    get_lc_risks,
+    get_lc_by_id,
     get_lc_by_order,
+    get_lc_risks,
     list_approved_lcs,
     parse_lc_text,
     save_lc_record,
     translate_lc_text,
     update_lc_risk_handling,
-    RISK_HANDLING_STATUSES,
+)
+from modules.lc_workbench import (
+    ALL_FIELD_INDEX,
+    build_pending_items,
+    build_pending_summary,
+    lc_parsed_values,
+    risk_target,
 )
 from modules.orders import get_order_by_id
+from modules.ui_style import (
+    page_header,
+    render_data_table,
+    section,
+    subsection,
+)
 from modules.workflow_navigation import (
     build_workflow_statuses,
+    consistency_state_key,
     invalidate_workflow_consistency,
     render_page_next_step,
     render_workflow_progress,
@@ -74,6 +90,7 @@ def shown_count(value):
 
 
 def risks_for_save(risks):
+    """汇总预览阶段的风险处理选择；只读取会话状态，不改写任何数据。"""
     updated = []
     for item in risks:
         if not isinstance(item, dict):
@@ -97,30 +114,37 @@ def risks_for_save(risks):
     return updated
 
 
-def render_risk_details(item, index):
-    level = str(item.get('risk_level') or '中')
-    heading = f"{index}. [{level}风险] {item.get('risk_type') or '信用证条款风险'}"
-    if level.casefold() in {'高', 'high', 'critical'}:
-        st.error(heading)
-    elif level.casefold() in {'中', 'medium'}:
-        st.warning(heading)
-    else:
-        st.info(heading)
-    st.markdown(f"**处理分级：** {item.get('handling_level') or ('必须处理' if level == '高' else '一般提示' if level == '低' else '需确认')}")
-    st.markdown(f"**英文原文：** {item.get('original_clause_en') or '—'}")
-    st.markdown(f"**中文翻译：** {item.get('clause_translation_cn') or '—'}")
-    st.markdown(f"**风险解释：** {item.get('risk_explanation_cn') or '—'}")
-    st.markdown(f"**整改建议：** {item.get('suggested_action_cn') or '—'}")
-    affected = item.get('affected_documents') or []
-    if isinstance(affected, str):
-        affected = [part.strip() for part in affected.split(',') if part.strip()]
-    st.markdown(f"**受影响单据：** {', '.join(affected) if affected else '待确认'}")
+def preview_risks_with_handling(risks, form_digest):
+    """把预览风险与用户在页面上的处理选择合并，仅用于统计与展示。"""
+    merged = []
+    for item in risks or []:
+        if not isinstance(item, dict):
+            continue
+        risk = dict(item)
+        key = f'{form_digest}_{risk_widget_key(risk)}'
+        risk['handling_status'] = st.session_state.get(
+            f'preview_risk_status_{key}',
+            risk.get('handling_status', '未处理'),
+        )
+        merged.append(risk)
+    return merged
+
+
+def render_evidence(evidence):
+    """第三层：按需展开的依据。默认不展示，不删除。"""
+    for label, value in evidence.items():
+        if value in (None, '', [], '—'):
+            continue
+        st.caption(f'{label}')
+        st.text(value if isinstance(value, str) else '；'.join(map(str, value)))
 
 
 owner_id = int(require_authenticated_user()['id'])
 
-st.title('信用证解析、条款分析与翻译')
-st.caption('先上传并确认信用证最终版本，再识别录入订单；信用证在订单确认时关联，并自动生成交单提醒。')
+page_header(
+    '信用证解析、条款分析与翻译',
+    caption='先上传并确认信用证最终版本，再识别录入订单；信用证在订单确认时关联，并自动生成交单提醒。',
+)
 st.info('信用证文本会发送到 .env 配置的 AI 服务；若本机 OCR 不可用，图片也会发送给支持视觉的 AI 服务。分析结果请人工核对后再同步。')
 
 approved_lcs = list_approved_lcs(owner_id)
@@ -144,25 +168,150 @@ if current_lc is None and current_order:
         ),
         None,
     )
-current_risks = get_lc_risks(current_lc['id']) if current_lc else []
-high_risk_open = any(
-    str(risk.get('risk_level') or '').strip().casefold() in {'高', 'high', 'critical'}
-    and risk.get('handling_status') not in {'已确认可接受', '已整改'}
-    for risk in current_risks
-)
-render_workflow_progress(
-    build_workflow_statuses(
-        current_order,
-        current_lc,
-        high_risk_open=high_risk_open,
-        lc_preview=bool(st.session_state.get('lc_analysis_preview')),
-    ),
-    '当前信用证存在未处理的高风险条款；可继续前往订单录入，建议先核对并处理风险。'
-    if high_risk_open else None,
-)
-render_page_next_step('下一步：前往订单录入', 'pages/4_订单录入与计算.py')
-st.divider()
 
+if approved_lcs:
+    lc_options = {
+        f"{item['lc_no']} · {item.get('applicant') or '申请人未填写'} · ID {item['id']}": item['id']
+        for item in approved_lcs
+    }
+    selected_risk_lc = st.selectbox(
+        '当前处理对象 · 已确认信用证',
+        list(lc_options),
+        key='risk_management_lc',
+    )
+    selected_lc_id = lc_options[selected_risk_lc]
+    if selected_lc_id != current_lc_id:
+        st.session_state['workflow_current_lc_id'] = selected_lc_id
+        current_lc_id = selected_lc_id
+        current_lc = next(
+            (item for item in approved_lcs if item.get('id') == current_lc_id),
+            None,
+        )
+        st.rerun()
+
+# 处理对象状态：全部为只读取数
+saved_record = get_lc_by_id(current_lc_id) if current_lc else None
+saved_parsed = lc_parsed_values(saved_record)
+saved_risks = sorted(get_lc_risks(current_lc_id), key=risk_sort_key) if current_lc else []
+preview = st.session_state.get('lc_analysis_preview')
+form_digest = st.session_state.get('lc_upload_digest', 'preview')
+consistency = st.session_state.get(consistency_state_key(current_order_id))
+
+# 预览态：字段取值与分组确认状态来自上一轮渲染，仅打开页面不会让字段变成已确认
+preview_field_values = {
+    field: st.session_state.get(f'lc_confirm_{form_digest}_{field}')
+    for _group, field, _label, _kind, _required in ALL_FIELD_INDEX
+}
+confirmed_groups = [
+    group_title
+    for group_title, _fields in FIELD_GROUPS
+    if st.session_state.get(f'lc_group_confirmed_{form_digest}_{group_title}')
+]
+
+if preview:
+    preview_parsed = preview.get('parsed') or {}
+    active_risks = preview_risks_with_handling(
+        preview_parsed.get('adverse_clauses'), form_digest
+    )
+elif current_lc:
+    preview_parsed = {}
+    active_risks = saved_risks
+else:
+    preview_parsed = {}
+    active_risks = []
+
+if preview:
+    active_documents = preview_parsed.get('documents_required') or []
+    active_field_values = preview_field_values
+    active_confirmed_groups = confirmed_groups
+else:
+    active_documents = saved_parsed.get('documents_required') or []
+    active_field_values = saved_parsed
+    # 已保存信用证没有逐组确认流程，缺失与无效字段仍要如实计入待确认
+    active_confirmed_groups = []
+
+summary = build_pending_summary(
+    risks=active_risks,
+    field_values=active_field_values,
+    confirmed_groups=active_confirmed_groups,
+    document_requirements=active_documents,
+    consistency=consistency,
+)
+pending_items = build_pending_items(
+    risks=active_risks,
+    field_values=active_field_values,
+    confirmed_groups=active_confirmed_groups,
+    document_requirements=active_documents,
+    consistency=consistency,
+)
+high_risk_open = summary['open_high_risk_count'] > 0
+
+if 'lc_active_item' not in st.session_state:
+    st.session_state['lc_active_item'] = None
+if 'lc_active_group' not in st.session_state:
+    st.session_state['lc_active_group'] = None
+
+# ── 第一层：当前对象与处理概况 ───────────────────────────────
+with st.container(border=True):
+    subsection('当前对象')
+    if current_lc:
+        customer_name = '—'
+        if current_order:
+            customer = get_customer_by_id(int(current_order['customer_id']), None) if current_order.get('customer_id') else None
+            customer_name = (
+                (customer or {}).get('customer_name_cn')
+                or (customer or {}).get('customer_name_en')
+                or '—'
+            )
+        object_columns = st.columns(3)
+        object_columns[0].metric(
+            '订单', current_order['order_no'] if current_order else '未关联订单'
+        )
+        object_columns[1].metric('客户', customer_name)
+        object_columns[2].metric(
+            '信用证号', current_lc.get('lc_no') or f"ID {current_lc.get('id')}"
+        )
+        if not current_order:
+            st.caption('该信用证尚未关联订单，关联后才能参与交单与 PDF 门禁校验。')
+            render_page_next_step(
+                '前往订单录入并关联该信用证', 'pages/4_订单录入与计算.py'
+            )
+    elif preview:
+        st.metric('本次分析文件', preview.get('filename') or '—')
+        st.caption('尚未保存为已确认信用证，确认并保存后才能关联订单。')
+    else:
+        st.caption('尚未选择信用证，也没有正在进行的分析。请先上传信用证文件。')
+
+    render_lc_deadline_cards(preview_parsed or saved_parsed, current_order)
+
+    subsection('处理概况')
+    metric_columns = st.columns(4)
+    metric_columns[0].metric('待确认字段', summary['pending_field_count'])
+    metric_columns[1].metric('未处理高风险', summary['open_high_risk_count'])
+    metric_columns[2].metric('待核对单据要求', summary['pending_document_count'])
+    metric_columns[3].metric(
+        'PDF 阻断',
+        '未运行校验' if not summary['has_consistency']
+        else f"{summary['blocking_count']} 项" if summary['blocking_count'] else '无',
+    )
+    if summary['blocking_reasons']:
+        for reason in summary['blocking_reasons'][:2]:
+            st.caption(f'阻断原因：{reason}')
+
+    render_workflow_progress(
+        build_workflow_statuses(
+            current_order,
+            current_lc,
+            high_risk_open=high_risk_open,
+            consistency=consistency,
+            lc_preview=bool(preview),
+        ),
+        '当前信用证存在未处理的高风险条款；可继续前往订单录入，建议先核对并处理风险。'
+        if high_risk_open else None,
+    )
+
+# ── 上传区：产生待办的入口 ──────────────────────────────────
+section('上传信用证文件', caption='上传后点击识别；识别结果与译文均需人工核对后再保存。')
 uploaded_file = st.file_uploader('上传信用证文件或图片', type=['pdf', 'png', 'jpg', 'jpeg'])
 if 'lc_analysis_preview' not in st.session_state:
     st.session_state['lc_analysis_preview'] = None
@@ -197,37 +346,69 @@ if uploaded_file is not None and st.button('识别、分析并翻译', type='pri
             with st.spinner('正在翻译信用证全文…'):
                 translation = translate_lc_text(raw_text)
             st.session_state['lc_analysis_preview']['translation'] = translation
+            st.session_state['lc_active_item'] = None
+            st.rerun()
     except (ValueError, RuntimeError, OSError, UnidentifiedImageError) as exc:
         st.error(f'处理失败：{exc}')
 
-if approved_lcs:
-    st.subheader('已确认信用证风险处理')
-    lc_options = {
-        f"{item['lc_no']} · {item.get('applicant') or '申请人未填写'} · ID {item['id']}": item['id']
-        for item in approved_lcs
-    }
-    selected_risk_lc = st.selectbox(
-        '选择已确认信用证',
-        list(lc_options),
-        key='risk_management_lc',
+# ── 第二层：待办处理区（第三层依据按需展开） ─────────────────
+section(
+    '待处理事项',
+    caption='按业务优先级排列：先处理必须处理项，再确认字段与单据要求。',
+)
+if not pending_items:
+    st.success('当前处理对象没有待处理事项。')
+    st.caption(
+        '本页待办处理完成，不等于全部单据已符合交单要求；'
+        '交单请以单证生成与导出页的一致性校验和 PDF 门禁结果为准。'
     )
-    selected_lc_id = lc_options[selected_risk_lc]
-    st.session_state['workflow_current_lc_id'] = selected_lc_id
-    saved_risks = sorted(get_lc_risks(selected_lc_id), key=risk_sort_key)
-    if not saved_risks:
-        st.success('该信用证没有已识别的风险条款。')
-    for risk_index, risk in enumerate(saved_risks, start=1):
+for index, item in enumerate(pending_items):
+    target = item['target']
+    with st.container(border=True):
+        title_column, status_column, action_column = st.columns([5, 3, 2])
+        with title_column:
+            st.markdown(f"**{item['title']}**")
+            st.caption(item['summary'])
+        with status_column:
+            st.caption(f"优先级：{item['priority']}")
+            st.caption(f"当前状态：{item['status']}")
+        with action_column:
+            is_active = st.session_state.get('lc_active_item') == target
+            if st.button(
+                '收起依据' if is_active else '查看并处理',
+                key=f'pending_toggle_{target}_{index}',
+                use_container_width=True,
+            ):
+                st.session_state['lc_active_item'] = None if is_active else target
+                if not is_active:
+                    if item['kind'] == 'field':
+                        st.session_state['lc_active_group'] = item['evidence'].get('所属分组')
+                    elif item['kind'] == 'high_risk':
+                        st.session_state['lc_active_group'] = target
+                st.rerun()
+        if st.session_state.get('lc_active_item') == target:
+            render_evidence(item['evidence'])
+
+st.caption(
+    '本页待办处理完成，不等于全部单据已符合交单要求；'
+    '交单请以单证生成与导出页的一致性校验和 PDF 门禁结果为准。'
+)
+
+# ── 第四层：处理操作 ────────────────────────────────────────
+if saved_risks and not preview:
+    section('高风险条款处理（已确认信用证）')
+    for risk in saved_risks:
+        level = str(risk.get('risk_level') or '中')
+        status = str(risk.get('handling_status') or '未处理')
         with st.expander(
-            f"[{risk.get('risk_level', '中')}风险] {risk.get('risk_type') or '信用证条款风险'}",
-            expanded=risk.get('risk_level') == '高' and risk.get('handling_status') == '未处理',
+            f"[{level}风险] {risk.get('risk_type') or '信用证条款风险'} · {status}",
+            expanded=st.session_state.get('lc_active_group') == risk_target(risk),
         ):
-            render_risk_details(risk, risk_index)
             st.caption(
-                f"当前状态：{risk.get('handling_status') or '未处理'} · "
-                f"处理时间：{risk.get('handled_at') or '尚未处理'}"
+                f"当前状态：{status} · 处理时间：{risk.get('handled_at') or '尚未处理'}"
             )
             with st.form(f"save_lc_risk_{risk['id']}"):
-                current_status = risk.get('handling_status') or '未处理'
+                current_status = status
                 status_index = (
                     RISK_HANDLING_STATUSES.index(current_status)
                     if current_status in RISK_HANDLING_STATUSES else 0
@@ -243,7 +424,11 @@ if approved_lcs:
                     value=risk.get('handling_note') or '',
                     key=f"risk_note_{risk['id']}",
                 )
-                save_risk = st.form_submit_button('保存处理记录')
+                st.caption(
+                    '「已确认可接受」表示人工接受该风险，不代表信用证风险已消除；'
+                    '处理一条风险不会绕过其他风险与一致性门禁。'
+                )
+                save_risk = st.form_submit_button('保存该条款的处理记录')
             if save_risk:
                 try:
                     update_lc_risk_handling(
@@ -252,88 +437,77 @@ if approved_lcs:
                         updated_note,
                         owner_id,
                     )
-                    st.success('风险处理状态、备注和处理时间已保存。')
+                    invalidate_workflow_consistency(current_order_id)
+                    st.session_state['lc_active_group'] = None
+                    st.success('该条款的处理状态、备注和处理时间已保存；相关旧校验结果已失效。')
                     st.rerun()
                 except ValueError as exc:
                     st.error(f'保存风险处理记录失败：{exc}')
 
-preview = st.session_state.get('lc_analysis_preview')
 if preview:
     st.caption(f"当前分析文件：{preview['filename']}")
-    st.subheader('识别出的信用证原文')
-    st.text_area('原文', preview['raw_text'], height=220, disabled=True, label_visibility='collapsed')
-
     analysis = preview.get('analysis')
     if analysis:
         parsed = preview['parsed']
-        st.subheader('信用证关键期限')
-        st.subheader('关键信息摘要')
-        st.text(build_lc_summary(parsed))
-        with st.expander('结构化字段'):
-            st.json(parsed)
 
-        st.subheader('不利或需重点关注的条款')
+        section('处理与保存本次分析')
+        subsection('高风险条款处理')
         adverse_clauses = sorted(analysis['adverse_clauses'], key=risk_sort_key)
         if adverse_clauses:
-            for index, item in enumerate(adverse_clauses, start=1):
+            for item in adverse_clauses:
                 item['handling_level'] = (
                     '必须处理' if item.get('risk_level') == '高'
                     else '一般提示' if item.get('risk_level') == '低'
                     else '需确认'
                 )
-                render_risk_details(item, index)
-                risk_key = (
-                    f"{st.session_state.get('lc_upload_digest', 'preview')}_"
-                    f"{risk_widget_key(item)}"
+                risk_key = f'{form_digest}_{risk_widget_key(item)}'
+                current_status = st.session_state.get(
+                    f'preview_risk_status_{risk_key}', '未处理'
                 )
-                status = st.selectbox(
-                    '处理状态',
-                    RISK_HANDLING_STATUSES,
-                    index=0,
-                    key=f'preview_risk_status_{risk_key}',
-                )
-                note = st.text_area(
-                    '处理备注',
-                    key=f'preview_risk_note_{risk_key}',
-                    placeholder='记录核对结论、客户反馈或信用证修改情况',
-                )
-                item['handling_status'] = status
-                item['handling_note'] = note
-                item['handled_at'] = (
-                    '确认信用证时由系统记录'
-                    if status != '未处理' or note.strip()
-                    else '尚未处理'
-                )
-                st.caption(f"处理时间：{item['handled_at']}")
+                with st.expander(
+                    f"[{item.get('risk_level', '中')}风险] "
+                    f"{item.get('risk_type') or '信用证条款风险'} · {current_status}",
+                    expanded=st.session_state.get('lc_active_group') == risk_target(item)
+                    or (
+                        item.get('risk_level') == '高'
+                        and current_status == '未处理'
+                    ),
+                ):
+                    st.caption(f"**英文原文：** {item.get('original_clause_en') or '—'}")
+                    st.caption(f"**中文翻译：** {item.get('clause_translation_cn') or '—'}")
+                    st.caption(f"**风险解释：** {item.get('risk_explanation_cn') or '—'}")
+                    st.caption(f"**整改建议：** {item.get('suggested_action_cn') or '—'}")
+                    st.selectbox(
+                        '处理状态',
+                        RISK_HANDLING_STATUSES,
+                        index=(
+                            RISK_HANDLING_STATUSES.index(current_status)
+                            if current_status in RISK_HANDLING_STATUSES else 0
+                        ),
+                        key=f'preview_risk_status_{risk_key}',
+                    )
+                    st.text_area(
+                        '处理备注',
+                        key=f'preview_risk_note_{risk_key}',
+                        placeholder='记录核对结论、客户反馈或信用证修改情况',
+                    )
+                    st.caption(
+                        '「已确认可接受」表示人工接受该风险，不代表信用证风险已消除。'
+                    )
         else:
             st.success('未识别到明显不利条款；仍建议人工核对信用证原文。')
 
-        st.subheader('单据要求及正副本份数')
-        requirements = analysis['document_requirements']
-        if requirements:
-            st.dataframe(
-                [
-                    {
-                        '单据类型': item['document_type'],
-                        '正本份数': item['original_count'] if item['original_count'] is not None else '原文未明确',
-                        '副本份数': item['copy_count'] if item['copy_count'] is not None else '原文未明确',
-                        '四单同步目标': '、'.join(item['affected_documents']) or '其他单据/待人工确认',
-                        '附加要求': item['special_requirements'] or '无',
-                    }
-                    for item in requirements
-                ],
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.warning('未从信用证中识别到明确的单据份数要求，请人工核对原文。')
-
-        st.subheader('确认信用证最终版本')
-        st.caption('逐组核对 AI 识别值并确认人工值；保存前会展示变更摘要并进行结构化校验。')
-        form_digest = st.session_state.get('lc_upload_digest', 'preview')
+        subsection('逐组确认字段')
         confirmed_values = {}
         for group_title, fields in FIELD_GROUPS:
-            with st.expander(group_title, expanded=True):
+            group_confirmed = bool(
+                st.session_state.get(f'lc_group_confirmed_{form_digest}_{group_title}')
+            )
+            with st.expander(
+                f'{group_title}（{"已确认" if group_confirmed else "待确认"}）',
+                expanded=st.session_state.get('lc_active_group') == group_title
+                or not group_confirmed,
+            ):
                 for field, label, kind, required, aliases in fields:
                     ai_value = parsed.get(field)
                     widget_key = f'lc_confirm_{form_digest}_{field}'
@@ -382,9 +556,7 @@ if preview:
                                 else ['Yes', 'No']
                             )
                             initial_boolean = (
-                                normalized_ai
-                                if normalized_ai
-                                else '待核对'
+                                normalized_ai if normalized_ai else '待核对'
                             )
                             selected_boolean = st.selectbox(
                                 label,
@@ -454,12 +626,19 @@ if preview:
                         with translation_col:
                             st.caption('中文翻译')
                             st.text(translated_excerpt)
+                if st.button(f'确认本组：{group_title}', key=f'group_confirm_{form_digest}_{group_title}'):
+                    st.session_state[f'lc_group_confirmed_{form_digest}_{group_title}'] = True
+                    st.session_state['lc_active_group'] = None
+                    st.rerun()
 
         deadline_values = merge_confirmed_values(parsed, confirmed_values, [])
-        render_lc_deadline_cards(deadline_values)
+        subsection('信用证关键期限')
+        render_lc_deadline_cards(deadline_values, current_order)
 
-        st.markdown('**单据要求组**')
+        subsection('单据要求（可编辑）')
         source_requirements = parsed.get('documents_required') or []
+        if not source_requirements:
+            st.warning('未从信用证中识别到明确的单据份数要求，请人工核对原文后手工补充。')
         document_editor_rows = [
             {
                 '_source_index': index,
@@ -546,14 +725,11 @@ if preview:
                 '数据来源': '人工确认值' if changed else 'AI条款分析 / 信用证原文',
             })
         if document_source_rows:
-            st.dataframe(
-                pd.DataFrame(document_source_rows),
-                hide_index=True,
-                use_container_width=True,
-            )
+            with st.expander(f'逐行来源对照（{len(document_source_rows)} 行）', expanded=False):
+                render_data_table([dict(row) for row in document_source_rows])
         final_translation = st.text_area(
             '信用证中文翻译（可修改）',
-            value=preview.get('translation', ''),
+            value=preview.get('translation') or '',
             key=f'lc_translation_{form_digest}',
             height=220,
         )
@@ -566,7 +742,6 @@ if preview:
             parsed.get('adverse_clauses', adverse_clauses)
         )
 
-        st.subheader('保存前变更摘要')
         change_summary = build_change_summary(parsed, confirmed_values)
         for row_index, row in enumerate(document_rows):
             source_index = row.get('_source_index')
@@ -603,16 +778,14 @@ if preview:
                 ),
                 '是否修改': '是' if changed else '否',
             })
-        st.dataframe(pd.DataFrame(change_summary), hide_index=True, use_container_width=True)
+        with st.expander(f'保存前变更摘要（{len(change_summary)} 项）', expanded=False):
+            render_data_table([dict(row) for row in change_summary])
 
         validation_errors = validate_confirmation(confirmed_values, document_rows)
         if not final_translation.strip():
             validation_errors.append('请确认并保存信用证中文翻译。')
         if validation_errors:
             st.error('结构化校验未通过：\n\n' + '\n'.join(f'- {error}' for error in validation_errors))
-
-        with st.expander('高级 JSON 视图（只读）'):
-            st.code(json.dumps(final_parsed_preview, ensure_ascii=False, indent=2), language='json')
 
         confirmed = st.checkbox(
             '我已逐项核对信用证原文、翻译、分组字段和单据要求，确认该版本可用于订单执行。',
@@ -643,16 +816,67 @@ if preview:
                     )
                     for key in list(st.session_state.keys()):
                         if str(key).startswith(f'lc_confirm_{form_digest}_') or str(key).startswith(
-                            f'preview_risk_'
-                        ):
+                            f'lc_group_confirmed_{form_digest}_'
+                        ) or str(key).startswith('preview_risk_'):
                             st.session_state.pop(key, None)
                     st.session_state.pop(f'lc_document_requirements_{form_digest}', None)
                     st.session_state.pop(f'lc_translation_{form_digest}', None)
                     st.session_state.pop(f'lc_final_confirmed_{form_digest}', None)
                     st.session_state.pop('lc_analysis_preview', None)
                     st.session_state.pop('lc_upload_digest', None)
+                    st.session_state['lc_active_item'] = None
+                    st.session_state['lc_active_group'] = None
                     st.success(f'信用证最终版本已确认保存（记录 ID：{lc_id}）。下一步请识别录入订单并关联该信用证。')
+                    st.rerun()
                 except (ValueError, TypeError) as exc:
                     st.error(f'无法保存信用证最终版本：{exc}')
     else:
         st.info('原文已提取。请配置 AI 服务后点击“识别、分析并翻译”以继续分析。')
+
+# ── 第五层：下一步入口 ──────────────────────────────────────
+section('下一步')
+next_columns = st.columns(3)
+with next_columns[0]:
+    if not current_order:
+        render_page_next_step('关联订单：前往订单录入', 'pages/4_订单录入与计算.py')
+    else:
+        render_page_next_step('前往单证生成与导出', 'pages/5_单证生成与导出.py')
+with next_columns[1]:
+    if summary['open_high_risk_count']:
+        st.caption(f"还有 {summary['open_high_risk_count']} 条高风险条款未处理，请先处理。")
+    elif summary['pending_field_count']:
+        st.caption(f"还有 {summary['pending_field_count']} 个字段待确认，请先确认。")
+    else:
+        st.caption('当前没有待处理事项，可继续下一步。')
+with next_columns[2]:
+    if summary['blocking_reasons']:
+        st.caption(f"存在 {summary['blocking_count']} 项 PDF 阻断，需在单证生成页重新运行一致性校验。")
+    elif not summary['has_consistency']:
+        st.caption('尚未运行一致性校验。')
+
+# ── 第三层的完整依据：原文与结构化视图（折叠保留，不常驻展开）──
+if preview:
+    with st.expander('识别出的信用证原文（只读）', expanded=False):
+        st.text_area(
+            '原文',
+            preview['raw_text'],
+            height=220,
+            disabled=True,
+            label_visibility='collapsed',
+        )
+    with st.expander('关键信息摘要（AI 生成）', expanded=False):
+        st.text(build_lc_summary(preview['parsed']))
+    with st.expander('结构化字段（AI 识别结果）', expanded=False):
+        st.json(preview['parsed'])
+    with st.expander('高级 JSON 视图（保存前预览）', expanded=False):
+        st.code(
+            json.dumps(
+                {
+                    'parsed': preview['parsed'],
+                    'analysis': preview.get('analysis') or {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            language='json',
+        )

@@ -11,6 +11,7 @@ from modules.auth import (
     set_user_active,
 )
 from modules.customers import list_customers
+from modules.ui_style import page_header, render_data_table, section
 
 
 current_user = require_authenticated_user()
@@ -18,16 +19,18 @@ if current_user['role'] != 'admin':
     st.error('仅管理员可以管理业务员账号。')
     st.stop()
 
-st.title('业务员账号管理')
-st.caption('账号停用后无法登录；客户及订单仍归原业务员所有，不会自动转给其他人。')
+page_header(
+    '业务员账号管理',
+    caption='账号停用后无法登录；客户及订单仍归原业务员所有，不会自动转给其他人。',
+)
 
-with st.form('create_salesperson_form'):
-    st.subheader('新增业务员')
-    username = st.text_input('登录账号')
-    display_name = st.text_input('业务员姓名')
-    password = st.text_input('初始密码（至少 10 位）', type='password')
-    confirm_password = st.text_input('确认初始密码', type='password')
-    create_button = st.form_submit_button('创建账号', type='primary')
+with st.expander('新增业务员', expanded=False):
+    with st.form('create_salesperson_form'):
+        username = st.text_input('登录账号')
+        display_name = st.text_input('业务员姓名')
+        password = st.text_input('初始密码（至少 10 位）', type='password')
+        confirm_password = st.text_input('确认初始密码', type='password')
+        create_button = st.form_submit_button('创建账号', type='primary')
 
 if create_button:
     if password != confirm_password:
@@ -40,24 +43,49 @@ if create_button:
         except ValueError as exc:
             st.error(str(exc))
 
-st.subheader('现有账号')
-for user in list_users():
-    left, right = st.columns([4, 1])
-    with left:
-        state = '启用' if user['is_active'] else '已停用'
-        role = '管理员' if user['role'] == 'admin' else '业务员'
-        st.markdown(f"**{user['display_name']}**（{user['username']}） · {role} · {state}")
-    if user['id'] != current_user['id']:
-        with right:
-            label = '停用账号' if user['is_active'] else '重新启用'
-            if st.button(label, key=f"user_active_{user['id']}"):
-                try:
-                    set_user_active(user['id'], not bool(user['is_active']), current_user['id'])
-                    st.rerun()
-                except ValueError as exc:
-                    st.error(str(exc))
+section('现有账号')
+users = list_users()
+role_labels = {'admin': '管理员', 'sales': '业务员'}
+render_data_table(
+    [
+        {
+            '姓名': user['display_name'],
+            '登录账号': user['username'],
+            '角色': role_labels.get(str(user['role']), str(user['role'])),
+            '状态': '启用' if user['is_active'] else '已停用',
+        }
+        for user in users
+    ],
+    empty_message='暂无账号记录。',
+)
 
-st.subheader('客户归属分配')
+other_users = [user for user in users if user['id'] != current_user['id']]
+if other_users:
+    user_labels = {
+        f"{user['display_name']}（{user['username']}）": user['id']
+        for user in other_users
+    }
+    user_selection_column, user_action_column = st.columns([3, 1])
+    with user_selection_column:
+        selected_user_label = st.selectbox('选择账号进行操作', list(user_labels))
+    target_user_id = user_labels[selected_user_label]
+    target_user = next(user for user in other_users if user['id'] == target_user_id)
+    with user_action_column:
+        if st.button(
+            '停用账号' if target_user['is_active'] else '重新启用',
+            use_container_width=True,
+        ):
+            try:
+                set_user_active(
+                    target_user_id,
+                    not bool(target_user['is_active']),
+                    current_user['id'],
+                )
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+section('客户归属分配')
 all_users = list_users()
 active_users = [item for item in all_users if item['is_active']]
 owner_options = {
@@ -65,33 +93,54 @@ owner_options = {
     for item in active_users
 }
 owner_labels_by_id = {item['id']: item['display_name'] for item in all_users}
-for customer in list_customers():
-    owner_label = owner_labels_by_id.get(customer.get('user_id'), '未分配')
-    st.markdown(
-        f"**{customer.get('customer_name_cn') or customer.get('customer_name_en')}** · "
-        f"当前归属：{owner_label}"
+customers = list_customers()
+render_data_table(
+    [
+        {
+            '客户': customer.get('customer_name_cn') or customer.get('customer_name_en') or f"#{customer['id']}",
+            '当前归属': owner_labels_by_id.get(customer.get('user_id'), '未分配'),
+        }
+        for customer in customers
+    ],
+    empty_message='暂无客户记录。',
+)
+
+if customers and active_users:
+    customer_labels = {
+        f"{customer.get('customer_name_cn') or customer.get('customer_name_en') or '客户'}（#{customer['id']}）": customer['id']
+        for customer in customers
+    }
+    customer_column, owner_column, assign_column = st.columns([2, 2, 1])
+    with customer_column:
+        selected_customer_label = st.selectbox('选择客户', list(customer_labels))
+    target_customer_id = customer_labels[selected_customer_label]
+    target_customer = next(
+        customer for customer in customers if customer['id'] == target_customer_id
     )
-    current_label = next(
-        (label for label, user_id in owner_options.items() if user_id == customer.get('user_id')),
+    current_owner_label = next(
+        (
+            label for label, user_id in owner_options.items()
+            if user_id == target_customer.get('user_id')
+        ),
         next(iter(owner_options)),
     )
-    with st.form(f"assign_customer_{customer['id']}"):
+    with owner_column:
         selected_owner = st.selectbox(
             '转交给业务员',
             list(owner_options),
-            index=list(owner_options).index(current_label),
-            key=f"owner_{customer['id']}",
+            index=list(owner_options).index(current_owner_label),
+            key='reassign_owner',
         )
-        assign = st.form_submit_button('保存客户归属')
-    if assign:
-        try:
-            assign_customer_owner(customer['id'], owner_options[selected_owner])
-            st.success('客户及其订单、已关联信用证已转交。')
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
+    with assign_column:
+        if st.button('保存客户归属', use_container_width=True):
+            try:
+                assign_customer_owner(target_customer_id, owner_options[selected_owner])
+                st.success('客户及其订单、已关联信用证已转交。')
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
-with st.expander('修改当前管理员密码'):
+with st.expander('修改当前管理员密码', expanded=False):
     with st.form('change_own_password_form'):
         new_password = st.text_input('新密码（至少 10 位）', type='password')
         repeat_password = st.text_input('重复新密码', type='password')

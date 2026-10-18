@@ -1,6 +1,7 @@
 streamlit>=1.35.0
 pandas>=2.2.0
 openpyxl>=3.1.0
+tzdata>=2025.1; platform_system == "Windows"
 python-docx>=1.1.0
 reportlab>=4.0.0
 PyMuPDF>=1.9.0
@@ -8,6 +9,7 @@ Pillow>=10.0.0
 pytesseract>=0.3.0
 python-dotenv>=1.0.0
 pywin32>=306; platform_system == "Windows"
+requests>=2.31.0
 loguru>=0.7.0
 langchain>=0.3.0
 faiss-cpu>=1.8.0

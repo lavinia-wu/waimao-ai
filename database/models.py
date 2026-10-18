@@ -23,6 +23,7 @@ CREATE_TABLES = [
         payment_terms TEXT,
         incoterm TEXT,
         remark TEXT,
+        country_code TEXT,
         user_id INTEGER REFERENCES users(id),
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -46,6 +47,13 @@ CREATE_TABLES = [
         product_description_en TEXT,
         transport_info TEXT,
         compliance_description TEXT,
+        sku TEXT,
+        stock_qty REAL,
+        unit TEXT,
+        safety_stock REAL,
+        warehouse TEXT,
+        stock_updated_at TEXT,
+        stock_updated_by INTEGER REFERENCES users(id),
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
@@ -161,12 +169,48 @@ CREATE_TABLES = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS market_countries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        country_code TEXT NOT NULL UNIQUE,
+        country_name_cn TEXT NOT NULL,
+        country_name_en TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT '',
+        currency_code TEXT,
+        business_language TEXT,
+        workday_note TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS country_holidays (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        country_code TEXT NOT NULL,
+        holiday_date TEXT NOT NULL,
+        name_cn TEXT NOT NULL,
+        name_en TEXT,
+        category TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT '全国',
+        is_nationwide INTEGER NOT NULL DEFAULT 0,
+        is_bank_holiday INTEGER NOT NULL DEFAULT 0,
+        date_status TEXT NOT NULL DEFAULT '预计',
+        impact TEXT NOT NULL DEFAULT '',
+        source TEXT,
+        source_note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(customer_name_cn, customer_name_en);
     CREATE INDEX IF NOT EXISTS idx_orders_order_no ON orders(order_no);
     CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
     CREATE INDEX IF NOT EXISTS idx_documents_order ON documents(order_id);
     CREATE INDEX IF NOT EXISTS idx_lc_order ON letters_of_credit(order_id);
     CREATE INDEX IF NOT EXISTS idx_reminders_order ON reminders(order_id);
+    CREATE INDEX IF NOT EXISTS idx_market_countries_code ON market_countries(country_code);
+    CREATE INDEX IF NOT EXISTS idx_country_holidays_scope ON country_holidays(country_code, holiday_date);
 
     """
 ]

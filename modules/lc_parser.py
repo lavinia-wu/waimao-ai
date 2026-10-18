@@ -499,6 +499,15 @@ def get_lc_by_order(order_id: int, owner_id: int | None = None) -> Dict[str, Any
         return dict(row)
 
 
+def get_lc_by_id(lc_id: int) -> Dict[str, Any] | None:
+    """只读读取单条信用证记录（含结构化字段原文），不做任何写入。"""
+    with get_connection() as conn:
+        row = conn.execute(
+            'SELECT * FROM letters_of_credit WHERE id = ?', (lc_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def list_approved_unlinked_lcs(owner_id: int) -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(

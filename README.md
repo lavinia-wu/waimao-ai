@@ -189,3 +189,6 @@ python -m pytest
 
 - `modules/consistency_check.py`：旧版单单一致性校验，已被 `modules/document_validation.py` 取代。
 - `modules/lc_risk.py`：旧版信用证风险分析，已被 `modules/lc_parser.py` 的 `analyze_lc_clauses()` 取代。
+- `modules/products.py` 的 `parse_chat_order_details()`：早期单条聊天识别，已被同一模块的
+  `parse_chat_product_requests()` + `match_products_for_request()` 取代。旧函数保留未删，
+  **已无调用方**，后续确认后即可移除。
